@@ -24,10 +24,11 @@ constexpr float LTD_TRACE_MS = 34.0f;
 struct NeuronGene {
     float capacitance_pf, leak_ns, rest_mv, threshold_mv, slope_mv;
     float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv, bias_pa;
+    float afterdepol_spike_pa, afterdepol_tau_ms;
     unsigned char type, active;
 };
 struct NeuronState {
-    float voltage_mv, adaptation_pa, inh_ns, recent_depol_mv, log_ampa_scale;
+    float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
     float dendrite_exc_ns[DENDRITES];
     int total_spikes;
     unsigned char spike;
@@ -50,8 +51,19 @@ NS_HD inline float bound(float x, float low, float high) {
 }
 
 NS_HD inline NeuronGene recorded_profile(unsigned char type) {
-    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 1, 1};
-    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 1};
+    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 0, 1, 1};
+    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 0, 1};
+}
+
+// Visual-cortex L5 protocol profile. The Naud step-current fit above remains
+// unchanged; the inward aftercurrent is fitted to Sjostrom et al.'s residual
+// 40 Hz depolarization, with a timescale consistent with cortical fADP recordings.
+NS_HD inline NeuronGene cortical_l5_profile() {
+    NeuronGene g = recorded_profile(0);
+    g.reset_mv = -68.0f;
+    g.afterdepol_spike_pa = 120.0f;
+    g.afterdepol_tau_ms = 45.0f;
+    return g;
 }
 
 NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
@@ -116,14 +128,17 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
             + g.leak_ns * g.slope_mv * expf(exponent)
             + soma_excitation(g, s) * (EXC_REVERSAL_MV - v)
             + s.inh_ns * (INH_REVERSAL_MV - v)
-            + current_pa - s.adaptation_pa;
+            + current_pa + s.afterdepol_pa - s.adaptation_pa;
         s.voltage_mv = v + h * dv / g.capacitance_pf;
         if (s.voltage_mv >= 0.0f) {
             s.spike = 1;
             ++s.total_spikes;
             s.voltage_mv = g.reset_mv;
             s.adaptation_pa += g.spike_adapt_pa;
+            s.afterdepol_pa += g.afterdepol_spike_pa;
         }
+        if (g.afterdepol_tau_ms > 0)
+            s.afterdepol_pa *= expf(-h / g.afterdepol_tau_ms);
         for (int branch = 0; branch < DENDRITES; ++branch)
             s.dendrite_exc_ns[branch] *= expf(-h / EXC_DECAY_MS);
         s.inh_ns *= expf(-h / INH_DECAY_MS);

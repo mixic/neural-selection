@@ -51,25 +51,34 @@ float paired_plasticity(int interval_ms, bool excitatory_target,
     return state.weight_ns;
 }
 
-float cortical_train(bool bursts, int &evoked_spikes) {
-    NeuronGene neuron = recorded_profile(0);
+float cortical_train(bool bursts, bool afterdepol, int &evoked_spikes,
+                     float &between_spike_mv) {
+    NeuronGene neuron = cortical_l5_profile();
+    if (!afterdepol) neuron.afterdepol_spike_pa = 0;
     NeuronState cell = initial_neuron_state(neuron);
     SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 2};
     SynapseState synapse = initial_synapse_state(gene);
     evoked_spikes = 0;
     int eligible_spikes = 0;
-    int duration = bursts ? 15000 : 500000;
+    float residual_sum = 0;
+    int residual_count = 0;
+    int duration = bursts ? 150000 : 500000;
     for (int t = 0; t < duration; ++t) {
-        bool pre = bursts ? (t % 1000 >= 100 && t % 1000 <= 200 &&
-                             (t % 1000 - 100) % 25 == 0)
+        bool pre = bursts ? (t % 10000 >= 100 && t % 10000 <= 200 &&
+                             (t % 10000 - 100) % 25 == 0)
                           : t % 10000 == 100;
-        bool post_stim = bursts ? (t % 1000 >= 110 && t % 1000 <= 210 &&
-                                   (t % 1000 - 110) % 25 == 0)
+        bool post_stim = bursts ? (t % 10000 >= 110 && t % 10000 <= 210 &&
+                                   (t % 10000 - 110) % 25 == 0)
                                 : t % 10000 == 110;
         float input[DENDRITES]{};
         if (pre) input[0] = 0.2f;
-        neuron_advance(neuron, cell, (bursts ? 25.0f : 0.0f)
-                       + (post_stim ? 3500.0f : 0.0f), input, 0);
+        if (bursts && post_stim && t % 10000 > 110) {
+            residual_sum += cell.voltage_mv - neuron.rest_mv;
+            ++residual_count;
+        }
+        neuron_advance(neuron, cell,
+                       post_stim ? (afterdepol ? 3500.0f : 5000.0f) : 0.0f,
+                       input, 0);
         if (cell.spike) ++evoked_spikes;
         if (cell.spike && cell.recent_depol_mv >= 2.3f) ++eligible_spikes;
         synapse_plasticity_step(gene, synapse, pre, cell.spike, true,
@@ -77,7 +86,33 @@ float cortical_train(bool bursts, int &evoked_spikes) {
     }
     std::cout << (bursts ? "burst" : "sparse") << " eligible spikes "
               << eligible_spikes << '/' << evoked_spikes << '\n';
+    between_spike_mv = residual_count ? residual_sum / residual_count : 0;
     return synapse.weight_ns;
+}
+
+struct Afterpotential {
+    int spikes;
+    float at_2_ms, at_10_ms, at_20_ms, at_80_ms;
+};
+
+Afterpotential isolated_afterpotential() {
+    NeuronGene neuron = cortical_l5_profile();
+    NeuronState cell = initial_neuron_state(neuron);
+    const float no_input[DENDRITES]{};
+    Afterpotential result{};
+    int first_spike = -1;
+    for (int t = 0; t < 200; ++t) {
+        neuron_advance(neuron, cell, t == 100 ? 3500.0f : 0, no_input, 0);
+        if (cell.spike) {
+            ++result.spikes;
+            if (first_spike < 0) first_spike = t;
+        }
+        if (t == first_spike + 2) result.at_2_ms = cell.voltage_mv - neuron.rest_mv;
+        if (t == first_spike + 10) result.at_10_ms = cell.voltage_mv - neuron.rest_mv;
+        if (t == first_spike + 20) result.at_20_ms = cell.voltage_mv - neuron.rest_mv;
+        if (t == first_spike + 80) result.at_80_ms = cell.voltage_mv - neuron.rest_mv;
+    }
+    return result;
 }
 
 int main() {
@@ -219,16 +254,36 @@ int main() {
               << ", cooperative " << cortical_cooperative
               << ", reverse " << cortical_ltd
               << ", NMDA blocked " << cortical_blocked << '\n';
-    int burst_spikes = 0, sparse_spikes = 0;
-    float burst_weight = cortical_train(true, burst_spikes);
-    float sparse_weight = cortical_train(false, sparse_spikes);
-    require(burst_spikes == 75 && sparse_spikes == 50,
+    auto afterpotential = isolated_afterpotential();
+    require(afterpotential.spikes == 1,
+            "an isolated cortical spike should not trigger additional spikes");
+    require(afterpotential.at_2_ms < afterpotential.at_20_ms &&
+            afterpotential.at_20_ms > 0 &&
+            afterpotential.at_80_ms < afterpotential.at_20_ms,
+            "a cortical spike should show early hyperpolarization then a fading ADP");
+    std::cout << "Cortical afterpotential at 2/10/20/80 ms: "
+              << afterpotential.at_2_ms << '/' << afterpotential.at_10_ms << '/'
+              << afterpotential.at_20_ms << '/' << afterpotential.at_80_ms << " mV\n";
+    int burst_spikes = 0, sparse_spikes = 0, no_adp_spikes = 0;
+    float burst_residual = 0, sparse_residual = 0, no_adp_residual = 0;
+    float burst_weight = cortical_train(true, true, burst_spikes, burst_residual);
+    float sparse_weight = cortical_train(false, true, sparse_spikes, sparse_residual);
+    float no_adp_weight = cortical_train(true, false, no_adp_spikes, no_adp_residual);
+    require(burst_spikes == 75 && sparse_spikes == 50 && no_adp_spikes == 75,
             "current pulses should evoke the requested cortical spike protocols");
+    require(burst_residual > 5 && burst_residual < 9,
+            "unassisted 40 Hz residual voltage should resemble the example recording");
     require(burst_weight > sparse_weight + 0.05f,
-            "depolarized 40 Hz bursts should potentiate more than sparse pairs");
-    std::cout << "Cortical train weights: depolarized 40 Hz " << burst_weight
+            "unassisted 40 Hz bursts should potentiate more than sparse pairs");
+    require(no_adp_weight < burst_weight - 0.05f &&
+            no_adp_residual < burst_residual - 3,
+            "removing the afterpotential should reduce residual voltage and LTP");
+    std::cout << "Cortical train weights: unassisted 40 Hz " << burst_weight
               << " (" << burst_spikes << " evoked), 0.1 Hz " << sparse_weight
-              << " (" << sparse_spikes << " evoked)\n";
+              << " (" << sparse_spikes << " evoked), between-spike "
+              << burst_residual << " mV; no-ADP 40 Hz " << no_adp_weight
+              << " (" << no_adp_spikes << " evoked), between-spike "
+              << no_adp_residual << " mV\n";
 
     NeuronGene pyramid = recorded_profile(0);
     NeuronGene interneuron = recorded_profile(1);

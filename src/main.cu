@@ -124,7 +124,7 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
     }
     for (int n = 0; n < N; ++n) {
         unsigned char type = n < S + M ? 0 : (unsigned char)randint(rng, 2);
-        NeuronGene g = recorded_profile(type);
+        NeuronGene g = type == 0 ? cortical_l5_profile() : recorded_profile(type);
         g.bias_pa = n >= S && n < S + M
             ? 110.0f + uniform(rng) * 90.0f
             : uniform(rng) * 100.0f;
@@ -293,14 +293,15 @@ __global__ void homeostasis_step(Device d) {
 __device__ void mutate(Device d, int child, unsigned long long &rng) {
     int mutations = 1 + randint(rng, 4);
     for (int m = 0; m < mutations; ++m) {
-        int choice = randint(rng, 8);
+        int choice = randint(rng, 9);
         int n = 16 + randint(rng, N - 16);
         int e = randint(rng, E);
         if (choice == 0) {
             d.neurons[child * N + n].active ^= 1;
         } else if (choice == 1) {
             auto active = d.neurons[child * N + n].active;
-            d.neurons[child * N + n] = recorded_profile((unsigned char)randint(rng, 2));
+            unsigned char type = (unsigned char)randint(rng, 2);
+            d.neurons[child * N + n] = type == 0 ? cortical_l5_profile() : recorded_profile(type);
             d.neurons[child * N + n].active = active;
         } else if (choice == 2) {
             auto &g = d.neurons[child * N + n];
@@ -321,7 +322,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             g.plasticity = (unsigned char)randint(rng, 3);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
-        } else {
+        } else if (choice == 7) {
             auto &g = d.synapses[child * E + e];
             g.delay = (unsigned char)(1 + randint(rng, D));
             g.facilitation_ms = g.facilitation_ms == 0
@@ -330,6 +331,14 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                    : clamp(g.facilitation_ms + (uniform(rng) - 0.5f) * 200, 100, 4000));
             d.neurons[child * N + n].spike_adapt_pa = clamp(
                 d.neurons[child * N + n].spike_adapt_pa + (uniform(rng) - 0.5f) * 5, 0, 150);
+        } else {
+            auto &g = d.neurons[child * N + n];
+            if (g.type == 0) {
+                g.afterdepol_spike_pa = clamp(g.afterdepol_spike_pa +
+                    (uniform(rng) - 0.5f) * 20, 0, 200);
+                g.afterdepol_tau_ms = clamp(g.afterdepol_tau_ms +
+                    (uniform(rng) - 0.5f) * 10, 10, 150);
+            }
         }
     }
 }
@@ -439,7 +448,7 @@ void write_brains(const std::string &prefix, Device d) {
     download(neuron_states, d.neuron_state, P * N);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,ampa_scale\n";
+    cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale\n";
     edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,release_sites,plasticity\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
@@ -449,6 +458,7 @@ void write_brains(const std::string &prefix, Device d) {
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
                 << g.reset_mv << ',' << g.bias_pa << ','
+                << g.afterdepol_spike_pa << ',' << g.afterdepol_tau_ms << ','
                 << expf(neuron_states[a * N + n].log_ampa_scale) << '\n';
         }
         for (int e = 0; e < E; ++e) {
