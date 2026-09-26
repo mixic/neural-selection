@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101a1b">
+  <title>Neural Selection — Live World</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-icon">◈</span><div><strong>NEURAL SELECTION</strong><small>LIVE WORLD OBSERVATORY</small></div></div>
+      <div class="run-status"><span id="status-dot" class="status-dot"></span><span id="status">CONNECTING</span><span class="separator"></span><span id="step-label">STEP 0 / 0</span></div>
+      <div class="toolbar">
+        <button id="pause" class="primary" title="Pause or resume (Space)">Pause</button>
+        <button id="speed1" class="speed active" title="20 world steps per second">1×</button>
+        <button id="speed4" class="speed" title="About 80 world steps per second">4×</button>
+        <button id="speed0" class="speed" title="Run as fast as the GPU allows">Max</button>
+        <button id="end" class="quiet" title="Finish the run and write outputs">End run</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="map-panel">
+        <div class="panel-head"><div><span class="eyebrow">01 / ENVIRONMENT</span><h1>The living world</h1><p>Follow movement, feeding, reproduction and loss as they happen.</p></div><div class="map-actions"><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="reset" title="Reset view">Fit</button></div></div>
+        <div id="map-wrap" class="map-wrap"><canvas id="world" aria-label="Live map of animals and food"></canvas><div class="map-corner top-left">128 × 128 CELLS</div><div class="map-corner bottom-left">SCROLL TO ZOOM · DRAG TO PAN · CLICK AN ANIMAL</div><div id="hover" class="hover" hidden></div></div>
+        <div class="legend"><span><i class="legend-dot animal"></i>Animal</span><span><i class="legend-dot selected"></i>Selected</span><span><i class="legend-dot birth"></i>Birth</span><span><i class="legend-dot death"></i>Death</span><span class="legend-divider"></span><span><i class="legend-dot food-a"></i>Food A</span><span><i class="legend-dot food-b"></i>Food B</span><span><i class="legend-dot food-c"></i>Food C</span></div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="overview card"><div class="section-label">02 / AT A GLANCE</div><div class="big-stat"><div><span>Living animals</span><strong id="population">—</strong></div><div class="trend">GLOBAL POPULATION</div></div><canvas id="population-chart" class="chart" aria-label="Population history"></canvas><div class="stat-grid"><div><span>Births</span><strong id="births">—</strong></div><div><span>Deaths</span><strong id="deaths">—</strong></div><div><span>Predation deaths</span><strong id="predation">—</strong></div><div><span>Bites</span><strong id="bites">—</strong></div><div><span>Food cells</span><strong id="food-cells">—</strong></div><div><span>Max generation</span><strong id="generation">—</strong></div></div></section>
+        <section class="inspector card"><div class="section-label">03 / INDIVIDUAL</div><div id="inspector-empty" class="empty"><div class="empty-icon">◎</div><h2>Choose an animal</h2><p>Click a marker on the map to follow its life, energy and brain size.</p></div><div id="inspector-detail" hidden><div class="identity"><div><span class="inspector-kicker">ANIMAL</span><h2 id="animal-id">#—</h2></div><span id="animal-generation" class="badge">GEN 0</span></div><div id="animal-presence" class="presence"></div><div class="vital"><div><span>Energy</span><strong id="energy">—</strong></div><div class="bar"><i id="energy-bar"></i></div></div><div class="vital"><div><span>Health</span><strong id="health">—</strong></div><div class="bar health"><i id="health-bar"></i></div></div><div class="detail-grid"><div><span>Age</span><strong id="age">—</strong></div><div><span>Position</span><strong id="position">—</strong></div><div><span>Neurons</span><strong id="neurons">—</strong></div><div><span>Synapses</span><strong id="synapses">—</strong></div><div><span>Active neurons</span><strong id="active-neurons">—</strong></div><div><span>Active synapses</span><strong id="active-synapses">—</strong></div><div><span>Fullness</span><strong id="fullness">—</strong></div><div><span>Pain</span><strong id="pain">—</strong></div></div><div class="taste"><span>TASTE SIGNALS</span><div id="taste-bars"></div></div></div></section>
+      </aside>
+    </main>
+    <footer><span>WORLD DATA UPDATES WHILE THE SIMULATION RUNS</span><span>16 NEURAL TICKS / WORLD STEP</span></footer>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

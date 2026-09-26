@@ -1,16 +1,22 @@
 #include <cuda_runtime.h>
 #include <png.h>
 #include "physiology.cuh"
+#include "live_view.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace sim {
@@ -877,9 +883,14 @@ void write_brains(const std::string &prefix, Device d) {
 
 } // namespace sim
 
+volatile std::sig_atomic_t interrupted = 0;
+void on_interrupt(int) { interrupted = 1; }
+
 int main(int argc, char **argv) {
     using namespace sim;
     int steps = 2000, initial = 1024;
+    int live_port = 8765;
+    bool visualize = false;
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
     std::string output = "run.csv";
@@ -890,11 +901,23 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--food-renewal") && i + 1 < argc)
             food_renewal = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
-        else { std::cerr << "Usage: neural_selection [--steps N] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv]\n"; return 2; }
+        else if (!strcmp(argv[i], "--visualize")) visualize = true;
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) live_port = atoi(argv[++i]);
+        else { std::cerr << "Usage: neural_selection [--steps N] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535]\n"; return 2; }
     }
     if (steps < 1 || initial < 1 || initial > P || !std::isfinite(food_renewal) ||
-        food_renewal < 0 || food_renewal > 1) {
-        std::cerr << "Invalid steps, population, or food renewal\n"; return 2;
+        food_renewal < 0 || food_renewal > 1 || live_port < 1 || live_port > 65535) {
+        std::cerr << "Invalid steps, population, food renewal, or port\n"; return 2;
+    }
+    std::unique_ptr<LiveView> live;
+    if (visualize) {
+        try { live = std::make_unique<LiveView>(live_port); }
+        catch (const std::exception &error) {
+            std::cerr << error.what() << '\n'; return 1;
+        }
+        std::signal(SIGINT, on_interrupt);
+        std::cout << "Live world: http://127.0.0.1:" << live_port << '/'
+                  << "  (Ctrl+C to close after the run)\n" << std::flush;
     }
     int count = 0;
     check(cudaGetDeviceCount(&count), "GPU discovery");
@@ -949,9 +972,9 @@ int main(int argc, char **argv) {
     csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots\n";
     std::vector<Animal> bodies;
     std::vector<int> active_neurons, active_synapses;
-    std::vector<int> food;
+    std::vector<int> food, kind;
     std::vector<uint32_t> neuron_used, synapse_used;
-    auto report = [&](int step) {
+    auto report = [&](int step, bool log) {
         count_brains<<<(P + 127) / 128, 128>>>(d);
         check(cudaDeviceSynchronize(), "simulation step");
         check(cudaGetLastError(), "CUDA kernel");
@@ -959,8 +982,11 @@ int main(int argc, char **argv) {
         download(active_neurons, d.active_neuron_counts, P);
         download(active_synapses, d.active_synapse_counts, P);
         download(food, d.food, W * H);
-        download(neuron_used, d.neuron_used, NEURON_CAPACITY / 32);
-        download(synapse_used, d.synapse_used, SYNAPSE_CAPACITY / 32);
+        if (live) download(kind, d.kind, W * H);
+        if (log) {
+            download(neuron_used, d.neuron_used, NEURON_CAPACITY / 32);
+            download(synapse_used, d.synapse_used, SYNAPSE_CAPACITY / 32);
+        }
         int alive = 0, max_generation = 0, births = 0, deaths = 0;
         int predation_deaths = 0, bites = 0;
         double energy = 0, neurons = 0, synapses = 0;
@@ -976,33 +1002,77 @@ int main(int argc, char **argv) {
             max_neuron_slots = std::max(max_neuron_slots, bodies[a].neuron_count);
             max_synapse_slots = std::max(max_synapse_slots, bodies[a].synapse_count);
         }
-        int occupied_neurons = 0, occupied_synapses = 0;
-        for (uint32_t word : neuron_used) occupied_neurons += __builtin_popcount(word);
-        for (uint32_t word : synapse_used) occupied_synapses += __builtin_popcount(word);
-        if (occupied_neurons != allocated_neurons ||
-            occupied_synapses != allocated_synapses) {
-            std::cerr << "Global pool accounting mismatch at step " << step << '\n';
-            std::exit(1);
+        if (log) {
+            int occupied_neurons = 0, occupied_synapses = 0;
+            for (uint32_t word : neuron_used) occupied_neurons += __builtin_popcount(word);
+            for (uint32_t word : synapse_used) occupied_synapses += __builtin_popcount(word);
+            if (occupied_neurons != allocated_neurons ||
+                occupied_synapses != allocated_synapses) {
+                std::cerr << "Global pool accounting mismatch at step " << step << '\n';
+                std::exit(1);
+            }
         }
         check(cudaMemcpy(&births, d.births, sizeof(int), cudaMemcpyDeviceToHost), "birth count");
         check(cudaMemcpy(&deaths, d.deaths, sizeof(int), cudaMemcpyDeviceToHost), "death count");
         check(cudaMemcpy(&predation_deaths, d.predation_deaths, sizeof(int), cudaMemcpyDeviceToHost), "predation count");
         check(cudaMemcpy(&bites, d.bites, sizeof(int), cudaMemcpyDeviceToHost), "bite count");
         int food_cells = std::count_if(food.begin(), food.end(), [](int amount) { return amount > 0; });
-        csv << step << ',' << alive << ',' << births << ',' << deaths << ','
-            << predation_deaths << ',' << bites << ',' << food_cells << ','
-            << max_generation << ','
-            << (alive ? energy / alive : 0) << ',' << (alive ? neurons / alive : 0) << ','
-            << (alive ? synapses / alive : 0) << ','
-            << allocated_neurons << ',' << allocated_synapses << ','
-            << max_neuron_slots << ',' << max_synapse_slots << '\n';
-        csv.flush();
-        std::cout << "step " << step << "  alive " << alive << "  births " << births
-                  << "  deaths " << deaths << "  predation " << predation_deaths
-                  << "  food " << food_cells << "  max generation " << max_generation << '\n';
+        if (log) {
+            csv << step << ',' << alive << ',' << births << ',' << deaths << ','
+                << predation_deaths << ',' << bites << ',' << food_cells << ','
+                << max_generation << ','
+                << (alive ? energy / alive : 0) << ',' << (alive ? neurons / alive : 0) << ','
+                << (alive ? synapses / alive : 0) << ','
+                << allocated_neurons << ',' << allocated_synapses << ','
+                << max_neuron_slots << ',' << max_synapse_slots << '\n';
+            csv.flush();
+            std::cout << "step " << step << "  alive " << alive << "  births " << births
+                      << "  deaths " << deaths << "  predation " << predation_deaths
+                      << "  food " << food_cells << "  max generation " << max_generation << '\n';
+        }
+        if (live) {
+            std::ostringstream json;
+            json.setf(std::ios::fixed);
+            json.precision(2);
+            json << "{\"step\":" << step << ",\"total\":" << steps
+                 << ",\"width\":" << W << ",\"height\":" << H
+                 << ",\"population\":" << alive << ",\"births\":" << births
+                 << ",\"deaths\":" << deaths << ",\"predation\":"
+                 << predation_deaths << ",\"bites\":" << bites
+                 << ",\"food_cells\":" << food_cells
+                 << ",\"mean_energy\":" << (alive ? energy / alive : 0)
+                 << ",\"max_generation\":" << max_generation
+                 << ",\"animals\":[";
+            bool first = true;
+            for (int a = 0; a < P; ++a) if (bodies[a].alive == 1) {
+                const Animal &b = bodies[a];
+                if (!first) json << ',';
+                first = false;
+                json << '[' << b.id << ',' << b.x << ',' << b.y << ','
+                     << b.heading << ',' << b.energy << ',' << b.health << ','
+                     << b.age << ',' << b.generation << ',' << b.neuron_count
+                     << ',' << b.synapse_count << ',' << active_neurons[a]
+                     << ',' << active_synapses[a] << ',' << b.fullness << ','
+                     << b.pain << ',' << b.taste[0] << ',' << b.taste[1]
+                     << ',' << b.taste[2] << ',' << b.taste[3] << ']';
+            }
+            json << "],\"food\":\"";
+            for (int c = 0; c < W * H; ++c)
+                json << (food[c] > 0 ? char('1' + kind[c]) : '0');
+            json << "\"}";
+            live->publish(json.str());
+        }
     };
-    report(0);
+    report(0, true);
+    int last_step = 0;
     for (int step = 1; step <= steps; ++step) {
+        if (interrupted || (live && live->stop_requested())) break;
+        if (live) {
+            while (live->paused() && !live->stop_requested() && !interrupted)
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (live->stop_requested() || interrupted) break;
+        }
+        auto frame_start = std::chrono::steady_clock::now();
         for (int t = 0; t < TICKS; ++t) {
             int tick = (step - 1) * TICKS + t;
             synapse_delivery<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
@@ -1021,11 +1091,26 @@ int main(int argc, char **argv) {
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
         update_senses<<<(P + 127) / 128, 128>>>(d);
-        if (step % 100 == 0 || step == steps) report(step);
+        last_step = step;
+        bool log = step % 100 == 0 || step == steps;
+        if (log || (live && step % 2 == 0)) report(step, log);
+        if (live && live->speed() > 0) {
+            int ms = live->speed() == 1 ? 50 : 12;
+            std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(ms));
+        }
     }
+    if (live && last_step > 0 && last_step < steps && last_step % 100 != 0)
+        report(last_step, true);
     write_world(output + ".png", d);
     write_brains(output, d);
     std::cout << "Wrote " << output << ", world image, and final brain tables\n";
+    if (live) {
+        live->finish();
+        std::cout << "Live view remains open at http://127.0.0.1:"
+                  << live_port << "/  Press Ctrl+C to close.\n" << std::flush;
+        while (!interrupted)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     cudaFree(d.animals); cudaFree(d.neurons); cudaFree(d.synapses);
     cudaFree(d.neuron_state); cudaFree(d.synapse_state);
     cudaFree(d.neuron_owner); cudaFree(d.synapse_owner);
