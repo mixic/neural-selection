@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include "lp_cell.cuh"
+#include "prinz_cell.cuh"
 
 #ifdef __CUDACC__
 #define NS_HD __host__ __device__
@@ -31,11 +32,13 @@ struct NeuronGene {
     float afterdepol_spike_pa, afterdepol_tau_ms;
     unsigned char type, active, modulator;
     LPConductance lp_scale;
+    PrinzConductance prinz_g;
+    float prinz_ambient_leak_ns;
 };
 struct NeuronState {
     float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
     float dendrite_exc_ns[DENDRITES];
-    LPCell lp;
+    union { LPCell lp; PrinzCell prinz; };
     int total_spikes;
     unsigned char spike;
 };
@@ -81,9 +84,18 @@ NS_HD inline NeuronGene lobster_lp_profile() {
     return g;
 }
 
+NS_HD inline NeuronGene crab_pacemaker_profile() {
+    NeuronGene g = recorded_profile(1);
+    g.type = 3;
+    g.bias_pa = 0;
+    g.prinz_g = prinz_pacemaker_conductance();
+    return g;
+}
+
 NS_HD inline NeuronGene initial_profile(unsigned char type) {
     return type == 0 ? cortical_l5_profile() :
-           (type == 1 ? recorded_profile(1) : lobster_lp_profile());
+           (type == 1 ? recorded_profile(1) :
+            (type == 2 ? lobster_lp_profile() : crab_pacemaker_profile()));
 }
 
 
@@ -93,6 +105,10 @@ NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
     if (g.type == 2) {
         state.lp = initial_lp_cell();
         state.voltage_mv = state.lp.x[15] - 9.342518882f;
+    }
+    if (g.type == 3) {
+        state.prinz = initial_prinz_cell();
+        state.voltage_mv = state.prinz.v;
     }
     return state;
 }
@@ -161,6 +177,23 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
         for (int branch = 0; branch < DENDRITES; ++branch)
             s.dendrite_exc_ns[branch] *= expf(-DT_MS / EXC_DECAY_MS);
         s.inh_ns *= expf(-DT_MS / INH_DECAY_MS);
+        return;
+    }
+    if (g.type == 3) {
+        float excitation = 0;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            excitation += s.dendrite_exc_ns[branch];
+        const float external_pa = current_pa +
+            excitation*(EXC_REVERSAL_MV-s.voltage_mv) +
+            s.inh_ns*(INH_REVERSAL_MV-s.voltage_mv);
+        s.spike = prinz_advance(s.prinz, g.prinz_g, external_pa,
+                                g.prinz_ambient_leak_ns + clamp_leak_ns,
+                                clamp_reversal_mv);
+        s.total_spikes += s.spike;
+        s.voltage_mv = s.prinz.v;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            s.dendrite_exc_ns[branch] *= expf(-DT_MS/EXC_DECAY_MS);
+        s.inh_ns *= expf(-DT_MS/INH_DECAY_MS);
         return;
     }
     constexpr int substeps = 4;
