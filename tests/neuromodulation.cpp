@@ -58,6 +58,38 @@ float striatal_eligibility(int dopamine_offset_ms, bool l_type_available,
     return synapse.weight_ns;
 }
 
+struct SpineResult { float stimulated, neighbor, electrical_weight; };
+
+// Yagishita et al. (2014): local glutamate/spike pairing and ten 30 Hz
+// optogenetic dopamine pulses at a specified delay from pairing onset.
+SpineResult spine_timing(int dopamine_offset_ms, bool pair = true,
+                         unsigned char receptors = MOD_DA,
+                         bool pka_available = true,
+                         bool nmda_available = true) {
+    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 5, 0, 14};
+    gene.mod_receptors = receptors;
+    SynapseState stimulated = initial_synapse_state(gene);
+    SynapseState neighbor = initial_synapse_state(gene);
+    constexpr int onset_ms = 1000;
+    for (int t = 0; t <= 6500; ++t) {
+        bool training = pair && t >= onset_ms && t < onset_ms + 1000;
+        int phase = t - onset_ms;
+        bool pre = training && phase % 100 == 0;
+        bool post = training && phase % 100 == 10;
+        int since_da = t - onset_ms - dopamine_offset_ms;
+        bool da = dopamine_offset_ms != -100000 && since_da >= 0 &&
+                  since_da <= 300 && since_da % 33 == 0;
+        synapse_plasticity_step(gene, stimulated, pre, post, true, 0,
+                                nmda_available, da ? MOD_DA : 0, true, true,
+                                pka_available);
+        synapse_plasticity_step(gene, neighbor, false, post, true, 0,
+                                nmda_available, da ? MOD_DA : 0, true, true,
+                                pka_available);
+    }
+    return {stimulated.spine_volume, neighbor.spine_volume,
+            stimulated.weight_ns};
+}
+
 int main() {
     int failures = 0;
     auto require = [&](bool ok, const char *message) {
@@ -122,5 +154,33 @@ int main() {
               << striatum_zero << '/' << striatum_two << '/'
               << striatum_four << ", +2 s no nimodipine "
               << striatum_two_no_nimo << '\n';
+    SpineResult spine_alone = spine_timing(-100000);
+    SpineResult spine_before = spine_timing(-1000);
+    SpineResult spine_600 = spine_timing(600);
+    SpineResult spine_1000 = spine_timing(1000);
+    SpineResult spine_late = spine_timing(5000);
+    SpineResult spine_da_only = spine_timing(600, false);
+    SpineResult spine_d1_blocked = spine_timing(600, true, 0);
+    SpineResult spine_pka_blocked = spine_timing(600, true, MOD_DA, false);
+    SpineResult spine_nmda_blocked = spine_timing(600, true, MOD_DA, true, false);
+    require(std::abs(spine_alone.stimulated - 1) < 1e-5f &&
+            std::abs(spine_before.stimulated - 1) < 1e-5f &&
+            std::abs(spine_late.stimulated - 1) < 0.01f,
+            "spine enlargement should require dopamine in the post-pairing window");
+    require(spine_600.stimulated > 1.1f &&
+            spine_1000.stimulated > spine_600.stimulated &&
+            std::abs(spine_600.neighbor - 1) < 1e-5f &&
+            std::abs(spine_600.electrical_weight - 1) < 1e-5f,
+            "timed dopamine should enlarge only the paired spine");
+    require(std::abs(spine_da_only.stimulated - 1) < 1e-5f &&
+            std::abs(spine_d1_blocked.stimulated - 1) < 1e-5f &&
+            std::abs(spine_pka_blocked.stimulated - 1) < 1e-5f &&
+            std::abs(spine_nmda_blocked.stimulated - 1) < 1e-5f,
+            "pairing, receptor, PKA, and NMDA dependence should hold");
+    std::cout << "Yagishita 2014: spine volume no DA/-1/+0.6/+1/+5 s "
+              << spine_alone.stimulated << '/' << spine_before.stimulated << '/'
+              << spine_600.stimulated << '/' << spine_1000.stimulated << '/'
+              << spine_late.stimulated << ", neighbor " << spine_600.neighbor
+              << '\n';
     return failures ? 1 : 0;
 }

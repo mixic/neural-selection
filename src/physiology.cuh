@@ -44,6 +44,7 @@ struct SynapseGene {
 struct SynapseState {
     float weight_ns, running_utilization, pre_trace, post_trace;
     float eligible_ltp, eligible_ltd, da_age_ms;
+    float spine_volume, structural_age_ms;
     float pre_age_ms, post_age_ms;
     int last_arrival_tick;
     uint32_t ready_mask, rng_state;
@@ -173,7 +174,8 @@ NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
     x ^= x >> 15; x *= 0x846ca68bu;
     x ^= x >> 16;
     if (!x) x = 1;
-    return {g.initial_weight_ns, 0, 0, 0, 0, 0, -1, 1000000, 1000000,
+    return {g.initial_weight_ns, 0, 0, 0, 0, 0, -1, 1, -1,
+            1000000, 1000000,
             -1000000, (1u << site_count(g)) - 1u, x, 0};
 }
 
@@ -183,6 +185,14 @@ NS_HD inline float delayed_da_eligibility(float age_ms) {
     if (age_ms < 0 || age_ms > 20000.0f) return 0;
     float x = age_ms / 2000.0f;
     return x * x * x * x * expf(4.0f * (1.0f - x));
+}
+
+// Fitted structural-plasticity window after spike pairing in Yagishita et al.
+// (2014). This returns a relative susceptibility, not a molecular PKA model.
+NS_HD inline float spine_growth_window(float age_ms) {
+    if (age_ms < 0 || age_ms > 5000.0f) return 0;
+    float x = age_ms / 1000.0f;
+    return x * x * x * expf(3.0f * (1.0f - x));
 }
 
 // Resource depletion (Tsodyks and Markram 1997), plus the pulse-driven
@@ -223,8 +233,25 @@ NS_HD inline void synapse_plasticity_step(const SynapseGene &g, SynapseState &s,
                                          bool nmda_available = true,
                                          unsigned char mod_event = 0,
                                          bool l_type_available = true,
-                                         bool calcium_permeable_ampa_available = true) {
+                                         bool calcium_permeable_ampa_available = true,
+                                         bool pka_available = true) {
     if (!g.plasticity || !excitatory_pair) return;
+    if (g.plasticity == 5) {
+        if (s.structural_age_ms >= 0) {
+            s.structural_age_ms += DT_MS;
+            if (s.structural_age_ms > 5000.0f) s.structural_age_ms = -1;
+        }
+        s.pre_age_ms += DT_MS;
+        if (arrived) s.pre_age_ms = 0;
+        if (nmda_available && postsynaptic_spike && s.pre_age_ms <= 15.0f &&
+            s.structural_age_ms < 0)
+            s.structural_age_ms = 0;
+        if ((mod_event & MOD_DA) && (g.mod_receptors & MOD_DA) &&
+            pka_available)
+            s.spine_volume = bound(s.spine_volume +
+                0.025f * spine_growth_window(s.structural_age_ms), 1.0f, 2.0f);
+        return;
+    }
     if (g.plasticity == 4) {
         // D1 striatal profile: pre/post conjunction creates a delayed silent
         // dopamine eligibility state and a competing L-type-dependent LTD.

@@ -105,10 +105,11 @@ __device__ void random_synapse(SynapseGene &g, Device d, int animal,
         g.facilitation_ms = 1700.0f;
     }
     float plasticity_draw = uniform(rng);
-    g.plasticity = plasticity_draw < 0.05f ? 4 :
-                   (plasticity_draw < 0.15f ? 3 : 2);
+    g.plasticity = plasticity_draw < 0.05f ? 5 :
+                   (plasticity_draw < 0.10f ? 4 :
+                   (plasticity_draw < 0.20f ? 3 : 2));
     g.mod_receptors = g.plasticity == 3 ? MOD_NE | MOD_5HT :
-                      (g.plasticity == 4 ? MOD_DA : 0);
+                      (g.plasticity >= 4 ? MOD_DA : 0);
     g.active = 1;
 }
 
@@ -343,10 +344,10 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 24);
         } else if (choice == 6) {
             auto &g = d.synapses[child * E + e];
-            g.plasticity = (unsigned char)randint(rng, 5);
+            g.plasticity = (unsigned char)randint(rng, 6);
             g.mod_receptors = g.plasticity == 3 ?
                 (unsigned char)(1 + randint(rng, 3)) :
-                (g.plasticity == 4 ? MOD_DA : 0);
+                (g.plasticity >= 4 ? MOD_DA : 0);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
         } else if (choice == 7) {
@@ -480,7 +481,7 @@ void write_brains(const std::string &prefix, Device d) {
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
     cells << "animal_id,generation,neuron,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale\n";
-    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors\n";
+    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
             const auto &g = neurons[a * N + n];
@@ -498,7 +499,8 @@ void write_brains(const std::string &prefix, Device d) {
             if (g.active && neurons[a * N + g.pre].active && neurons[a * N + g.post].active)
                 edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
                     << g.pre << ',' << g.post << ',' << (int)g.branch << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
-                    << states[a * E + e].weight_ns << ',' << g.utilization << ','
+                    << states[a * E + e].weight_ns << ','
+                    << states[a * E + e].spine_volume << ',' << g.utilization << ','
                     << g.recovery_ms << ',' << g.facilitation_ms << ','
                     << (int)g.release_sites << ',' << (int)g.plasticity << ','
                     << (int)g.mod_receptors << '\n';
