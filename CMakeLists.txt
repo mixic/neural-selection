@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.24)
+project(neural_selection LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+add_executable(neural_selection src/main.cu)
+set_target_properties(neural_selection PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+target_compile_options(neural_selection PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+find_package(PNG REQUIRED)
+target_link_libraries(neural_selection PRIVATE PNG::PNG)
+
+add_executable(physiology_protocols tests/physiology.cpp)
+target_include_directories(physiology_protocols PRIVATE src)
+enable_testing()
+add_test(NAME physiology_protocols COMMAND physiology_protocols)
