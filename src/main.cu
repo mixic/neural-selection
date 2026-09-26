@@ -15,8 +15,10 @@
 
 namespace sim {
 constexpr int P = 2048;
-constexpr int N = 69;
-constexpr int E = 384;
+constexpr int NEURON_CAPACITY = 262144;
+constexpr int SYNAPSE_CAPACITY = 524288;
+constexpr int INITIAL_HIDDEN = 48;
+constexpr int INITIAL_SYNAPSES = 120;
 constexpr int S = 16;
 constexpr int M = 5;
 constexpr int W = 128;
@@ -36,6 +38,8 @@ struct Animal {
     float taste[4];
     unsigned long long rng;
     int id, generation, age, alive;
+    int neuron_head, synapse_head, neuron_count, synapse_count;
+    int ports[S + M];
 };
 struct Device {
     Animal *animals;
@@ -46,6 +50,10 @@ struct Device {
     float *pending_exc, *pending_inh, *senses;
     int *mod_event_tick;
     unsigned char *spike_history;
+    int *neuron_owner, *synapse_owner, *neuron_next, *synapse_next;
+    int *neuron_port, *neuron_clone;
+    uint32_t *neuron_used, *synapse_used;
+    int *active_neuron_counts, *active_synapse_counts;
     unsigned char *bite_intent;
     int *motors, *food, *kind, *cell_head, *cell_next;
     int *births, *deaths, *predation_deaths, *bites, *next_id;
@@ -85,6 +93,99 @@ __device__ inline bool harvest(int *stock) {
     return false;
 }
 
+// Atomic bitmap allocation lets a genome grow until the shared pool is full.
+// No animal owns a fixed range of neuron or synapse slots.
+__device__ int claim_slot(uint32_t *used, int capacity, int hint) {
+    int words = (capacity + 31) / 32;
+    int start = hint % words;
+    for (int offset = 0; offset < words; ++offset) {
+        int word = (start + offset) % words;
+        uint32_t occupied = atomicAdd(&used[word], 0u);
+        while (~occupied) {
+            int bit = __ffs(~occupied) - 1;
+            uint32_t mask = 1u << bit;
+            uint32_t observed = atomicCAS(&used[word], occupied,
+                                          occupied | mask);
+            if (observed == occupied) {
+                int slot = word * 32 + bit;
+                if (slot < capacity) return slot;
+                atomicAnd(&used[word], ~mask);
+                return -1;
+            }
+            occupied = observed;
+        }
+    }
+    return -1;
+}
+
+__device__ void release_slot(uint32_t *used, int slot) {
+    atomicAnd(&used[slot / 32], ~(1u << (slot % 32)));
+}
+
+__device__ int neuron_at(Device d, const Animal &body, int ordinal) {
+    int n = body.neuron_head;
+    for (int j = 0; j < ordinal && n >= 0; ++j) n = d.neuron_next[n];
+    return n;
+}
+
+__device__ int synapse_at(Device d, const Animal &body, int ordinal) {
+    int e = body.synapse_head;
+    for (int j = 0; j < ordinal && e >= 0; ++j) e = d.synapse_next[e];
+    return e;
+}
+
+__device__ int random_hidden_neuron(Device d, const Animal &body,
+                                    unsigned long long &rng) {
+    int hidden_count = body.neuron_count - (S + M);
+    if (hidden_count <= 0) return -1;
+    int ordinal = randint(rng, hidden_count);
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n])
+        if (d.neuron_port[n] < 0 && ordinal-- == 0) return n;
+    return -1;
+}
+
+__device__ void initialize_neuron(Device d, int n, int owner, int port,
+                                  const NeuronGene &gene, int next) {
+    d.neuron_owner[n] = owner;
+    d.neuron_next[n] = next;
+    d.neuron_port[n] = port;
+    d.neurons[n] = gene;
+    d.neuron_state[n] = initial_neuron_state(gene);
+    for (int branch = 0; branch < DENDRITES; ++branch)
+        d.pending_exc[n * DENDRITES + branch] = 0;
+    d.pending_inh[n] = 0;
+    for (int k = 0; k < 3; ++k) d.mod_event_tick[n * 3 + k] = -1;
+    for (int delay = 0; delay < HISTORY; ++delay)
+        d.spike_history[delay * NEURON_CAPACITY + n] = 0;
+}
+
+__device__ void initialize_synapse(Device d, int e, int owner,
+                                   const SynapseGene &gene, int next,
+                                   unsigned long long &rng) {
+    d.synapse_owner[e] = owner;
+    d.synapse_next[e] = next;
+    d.synapses[e] = gene;
+    d.synapse_state[e] = initial_synapse_state(gene, (uint32_t)random64(rng));
+}
+
+__device__ void release_genome(Device d, Animal &body) {
+    for (int e = body.synapse_head; e >= 0;) {
+        int next = d.synapse_next[e];
+        d.synapse_owner[e] = -1;
+        release_slot(d.synapse_used, e);
+        e = next;
+    }
+    for (int n = body.neuron_head; n >= 0;) {
+        int next = d.neuron_next[n];
+        d.neuron_owner[n] = -1;
+        release_slot(d.neuron_used, n);
+        n = next;
+    }
+    body.neuron_head = body.synapse_head = -1;
+    body.neuron_count = body.synapse_count = 0;
+    for (int p = 0; p < S + M; ++p) body.ports[p] = -1;
+}
+
 __global__ void init_world(Device d, unsigned long long seed) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= W * H) return;
@@ -95,8 +196,16 @@ __global__ void init_world(Device d, unsigned long long seed) {
 
 __device__ void random_synapse(SynapseGene &g, Device d, int animal,
                                unsigned long long &rng) {
-    g.pre = (short)randint(rng, N);
-    g.post = (short)(S + randint(rng, N - S));
+    Animal body = d.animals[animal];
+    g.pre = neuron_at(d, body, randint(rng, body.neuron_count));
+    g.post = body.ports[S + randint(rng, M)];
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        int target = neuron_at(d, body, randint(rng, body.neuron_count));
+        if (d.neuron_port[target] >= S || d.neuron_port[target] < 0) {
+            g.post = target;
+            break;
+        }
+    }
     g.delay = (unsigned char)(1 + randint(rng, D));
     g.branch = (unsigned char)randint(rng, DENDRITES);
     g.initial_weight_ns = 0.5f + uniform(rng) * 3.5f;
@@ -104,8 +213,7 @@ __device__ void random_synapse(SynapseGene &g, Device d, int animal,
     g.recovery_ms = 450.0f;
     g.facilitation_ms = 0;
     g.release_sites = 14;
-    if (d.neurons[animal * N + g.pre].type == 0 &&
-        d.neurons[animal * N + g.post].type == 1) {
+    if (d.neurons[g.pre].type == 0 && d.neurons[g.post].type == 1) {
         // One fitted pyramidal-to-interneuron profile in Markram et al. (1998).
         g.utilization = 0.1f;
         g.recovery_ms = 30.0f;
@@ -125,44 +233,58 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
     if (a >= P) return;
     auto rng = seed_for(seed, a);
     Animal body{};
+    body.neuron_head = body.synapse_head = -1;
+    for (int p = 0; p < S + M; ++p) body.ports[p] = -1;
     body.rng = rng;
-    if (a < initial) {
-        body.x = uniform(rng) * (W - 1);
-        body.y = uniform(rng) * (H - 1);
-        body.heading = uniform(rng) * 2.0f * PI;
-        body.energy = 14.0f;
-        body.health = 10.0f;
-        body.id = a;
-        body.alive = 1;
-    }
-    for (int n = 0; n < N; ++n) {
-        unsigned char type = n < S + M ? 0 : (unsigned char)randint(rng, 2);
+    if (a >= initial) { d.animals[a] = body; return; }
+    body.x = uniform(rng) * (W - 1);
+    body.y = uniform(rng) * (H - 1);
+    body.heading = uniform(rng) * 2.0f * PI;
+    body.energy = 14.0f;
+    body.health = 10.0f;
+    body.id = a;
+    body.alive = 1;
+    for (int local = 0; local < S + M + INITIAL_HIDDEN; ++local) {
+        int n = claim_slot(d.neuron_used, NEURON_CAPACITY,
+                           a * (S + M + INITIAL_HIDDEN) + local);
+        if (n < 0) {
+            release_genome(d, body);
+            body.alive = 0;
+            d.animals[a] = body;
+            return;
+        }
+        int port = local < S + M ? local : -1;
+        unsigned char type = port >= 0 ? 0 : (unsigned char)randint(rng, 2);
         NeuronGene g = type == 0 ? cortical_l5_profile() : recorded_profile(type);
-        if (n >= S + M) {
+        if (port < 0) {
             float u = uniform(rng);
             g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 :
                           (u < 0.12f ? 3 : 0));
         }
-        g.bias_pa = n >= S && n < S + M - 1
+        g.bias_pa = port >= S && port < S + M - 1
             ? 110.0f + uniform(rng) * 90.0f
             : uniform(rng) * 100.0f;
-        g.active = (n < S + M || uniform(rng) < 0.5f) ? 1 : 0;
-        d.neurons[a * N + n] = g;
-        d.neuron_state[a * N + n] = initial_neuron_state(g);
-        for (int branch = 0; branch < DENDRITES; ++branch)
-            d.pending_exc[(a * N + n) * DENDRITES + branch] = 0;
-        d.pending_inh[a * N + n] = 0;
-        for (int k = 0; k < 3; ++k)
-            d.mod_event_tick[(a * N + n) * 3 + k] = -1;
-        for (int delay = 0; delay < HISTORY; ++delay)
-            d.spike_history[(delay * P + a) * N + n] = 0;
+        g.active = port >= 0 || uniform(rng) < 0.5f;
+        initialize_neuron(d, n, a, port, g, body.neuron_head);
+        body.neuron_head = n;
+        ++body.neuron_count;
+        if (port >= 0) body.ports[port] = n;
     }
-    for (int e = 0; e < E; ++e) {
+    d.animals[a] = body;
+    for (int local = 0; local < INITIAL_SYNAPSES; ++local) {
+        int e = claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
+                           a * INITIAL_SYNAPSES + local);
+        if (e < 0) {
+            release_genome(d, body);
+            body.alive = 0;
+            d.animals[a] = body;
+            return;
+        }
         SynapseGene g{};
         random_synapse(g, d, a, rng);
-        g.active = (e < 120) ? 1 : 0;
-        d.synapses[a * E + e] = g;
-        d.synapse_state[a * E + e] = initial_synapse_state(g, (uint32_t)random64(rng));
+        initialize_synapse(d, e, a, g, body.synapse_head, rng);
+        body.synapse_head = e;
+        ++body.synapse_count;
     }
     for (int s = 0; s < S; ++s) d.senses[a * S + s] = 0;
     for (int m = 0; m < M; ++m) d.motors[a * M + m] = 0;
@@ -213,37 +335,41 @@ __global__ void update_senses(Device d) {
 
 __global__ void synapse_delivery(Device d, int tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= P * E) return;
-    int a = i / E;
+    if (i >= SYNAPSE_CAPACITY) return;
+    int a = d.synapse_owner[i];
+    if (a < 0) return;
     if (d.animals[a].alive != 1) return;
     SynapseGene g = d.synapses[i];
-    if (!g.active || !d.neurons[a * N + g.pre].active || !d.neurons[a * N + g.post].active) return;
+    if (!g.active || d.neuron_owner[g.pre] != a ||
+        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
+        !d.neurons[g.post].active) return;
     SynapseState state = d.synapse_state[i];
     state.arrived = tick >= g.delay &&
-        d.spike_history[(((tick - g.delay) % HISTORY) * P + a) * N + g.pre];
+        d.spike_history[((tick - g.delay) % HISTORY) * NEURON_CAPACITY + g.pre];
     if (state.arrived) {
-        NeuronGene source = d.neurons[a * N + g.pre];
+        NeuronGene source = d.neurons[g.pre];
         float released = source.type == 0 || source.modulator
             ? synapse_release(g, state, tick) : state.weight_ns;
         if (source.modulator) {
             if (released > 0)
-                atomicMax(&d.mod_event_tick[(a * N + g.post) * 3 + source.modulator - 1], tick);
+                atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1], tick);
         } else if (source.type == 0) {
             float postsynaptic_scale = expf(
-                d.neuron_state[a * N + g.post].log_ampa_scale);
-            atomicAdd(&d.pending_exc[(a * N + g.post) * DENDRITES + g.branch],
+                d.neuron_state[g.post].log_ampa_scale);
+            atomicAdd(&d.pending_exc[g.post * DENDRITES + g.branch],
                       released * postsynaptic_scale);
         }
         else
-            atomicAdd(&d.pending_inh[a * N + g.post], released);
+            atomicAdd(&d.pending_inh[g.post], released);
     }
     d.synapse_state[i] = state;
 }
 
 __global__ void neuron_step(Device d, int tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= P * N) return;
-    int a = i / N, n = i % N;
+    if (i >= NEURON_CAPACITY) return;
+    int a = d.neuron_owner[i];
+    if (a < 0) return;
     if (d.animals[a].alive != 1) return;
     NeuronGene g = d.neurons[i];
     if (!g.active) return;
@@ -256,33 +382,38 @@ __global__ void neuron_step(Device d, int tick) {
     }
     float inh = d.pending_inh[i];
     d.pending_inh[i] = 0;
-    float sensory = n < S ? d.senses[a * S + n] * 230.0f : 0.0f;
+    int port = d.neuron_port[i];
+    float sensory = port >= 0 && port < S ?
+        d.senses[a * S + port] * 230.0f : 0.0f;
     neuron_advance(g, state, g.bias_pa + sensory, exc, inh);
-    if (state.spike && n >= S && n < S + M)
-        atomicAdd(&d.motors[a * M + n - S], 1);
-    d.spike_history[((tick % HISTORY) * P + a) * N + n] = state.spike;
+    if (state.spike && port >= S && port < S + M)
+        atomicAdd(&d.motors[a * M + port - S], 1);
+    d.spike_history[(tick % HISTORY) * NEURON_CAPACITY + i] = state.spike;
     d.neuron_state[i] = state;
 }
 
 __global__ void synapse_plasticity(Device d, int tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= P * E) return;
-    int a = i / E;
+    if (i >= SYNAPSE_CAPACITY) return;
+    int a = d.synapse_owner[i];
+    if (a < 0) return;
     if (d.animals[a].alive != 1) return;
     SynapseGene g = d.synapses[i];
-    if (!g.active || !d.neurons[a * N + g.pre].active || !d.neurons[a * N + g.post].active) return;
+    if (!g.active || d.neuron_owner[g.pre] != a ||
+        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
+        !d.neurons[g.post].active) return;
     SynapseState s = d.synapse_state[i];
-    bool excitatory_pair = d.neurons[a * N + g.pre].type == 0 &&
-        d.neurons[a * N + g.pre].modulator == 0 &&
-        d.neurons[a * N + g.post].type == 0;
-    int target = (a * N + g.post) * 3;
+    bool excitatory_pair = d.neurons[g.pre].type == 0 &&
+        d.neurons[g.pre].modulator == 0 &&
+        d.neurons[g.post].type == 0;
+    int target = g.post * 3;
     unsigned char mod_event = 0;
     if (d.mod_event_tick[target] == tick) mod_event |= MOD_NE;
     if (d.mod_event_tick[target + 1] == tick) mod_event |= MOD_5HT;
     if (d.mod_event_tick[target + 2] == tick) mod_event |= MOD_DA;
     synapse_plasticity_step(g, s, s.arrived,
-        d.neuron_state[a * N + g.post].spike, excitatory_pair,
-        d.neuron_state[a * N + g.post].recent_depol_mv, true, mod_event);
+        d.neuron_state[g.post].spike, excitatory_pair,
+        d.neuron_state[g.post].recent_depol_mv, true, mod_event);
     d.synapse_state[i] = s;
 }
 
@@ -308,8 +439,8 @@ __global__ void body_step(Device d) {
     b.x = clamp(b.x + cosf(b.heading) * thrust * 1.5f, 0, W - 0.001f);
     b.y = clamp(b.y + sinf(b.heading) * thrust * 1.5f, 0, H - 0.001f);
     int active_neurons = 0;
-    for (int n = 0; n < N; ++n)
-        active_neurons += d.neurons[a * N + n].active;
+    for (int n = b.neuron_head; n >= 0; n = d.neuron_next[n])
+        active_neurons += d.neurons[n].active;
     b.energy -= BODY_UPKEEP + active_neurons * NEURON_UPKEEP +
                 thrust * 0.02f +
                 (d.bite_intent[a] ? BITE_ENERGY_COST : 0.0f);
@@ -366,8 +497,9 @@ __global__ void finish_predation(Device d) {
 
 __global__ void homeostasis_step(Device d) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= P * N) return;
-    int a = i / N;
+    if (i >= NEURON_CAPACITY) return;
+    int a = d.neuron_owner[i];
+    if (a < 0) return;
     if (d.animals[a].alive != 1 || !d.neurons[i].active) return;
     NeuronState state = d.neuron_state[i];
     float elapsed_ms = fmaxf(16.0f, d.animals[a].age * 16.0f);
@@ -376,62 +508,150 @@ __global__ void homeostasis_step(Device d) {
     d.neuron_state[i] = state;
 }
 
+__global__ void reclaim_dead_genomes(Device d) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P || d.animals[a].alive != 0) return;
+    Animal body = d.animals[a];
+    if (body.neuron_head < 0 && body.synapse_head < 0) return;
+    release_genome(d, body);
+    d.animals[a] = body;
+}
+
+__global__ void count_brains(Device d) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P) return;
+    Animal body = d.animals[a];
+    int neurons = 0, synapses = 0;
+    if (body.alive == 1) {
+        for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n])
+            neurons += d.neurons[n].active;
+        for (int e = body.synapse_head; e >= 0; e = d.synapse_next[e]) {
+            SynapseGene g = d.synapses[e];
+            synapses += g.active && d.neurons[g.pre].active &&
+                        d.neurons[g.post].active;
+        }
+    }
+    d.active_neuron_counts[a] = neurons;
+    d.active_synapse_counts[a] = synapses;
+}
+
 __device__ void mutate(Device d, int child, unsigned long long &rng) {
     int mutations = 1 + randint(rng, 4);
     for (int m = 0; m < mutations; ++m) {
         int choice = randint(rng, 10);
-        int n = S + M + randint(rng, N - S - M);
-        int e = randint(rng, E);
+        Animal body = d.animals[child];
+        int n = random_hidden_neuron(d, body, rng);
+        int e = body.synapse_count ?
+            synapse_at(d, body, randint(rng, body.synapse_count)) : -1;
         if (choice == 0) {
-            d.neurons[child * N + n].active ^= 1;
-        } else if (choice == 1) {
-            auto active = d.neurons[child * N + n].active;
+            if (uniform(rng) < 0.5f) {
+                int added = claim_slot(d.neuron_used, NEURON_CAPACITY,
+                                       child * 131 + body.neuron_count);
+                int incoming = added >= 0 ?
+                    claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
+                               child * 257 + body.synapse_count) : -1;
+                int outgoing = incoming >= 0 ?
+                    claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
+                               child * 257 + body.synapse_count + 1) : -1;
+                if (added >= 0 && incoming >= 0 && outgoing >= 0 && e >= 0) {
+                    int template_e = e;
+                    for (int attempt = 0; attempt < 8; ++attempt) {
+                        int candidate = synapse_at(d, body,
+                            randint(rng, body.synapse_count));
+                        SynapseGene candidate_gene = d.synapses[candidate];
+                        if (candidate_gene.active &&
+                            d.neurons[candidate_gene.pre].active &&
+                            d.neurons[candidate_gene.post].active) {
+                            template_e = candidate;
+                            break;
+                        }
+                    }
+                    unsigned char type = (unsigned char)randint(rng, 2);
+                    NeuronGene g = type == 0 ? cortical_l5_profile() : recorded_profile(type);
+                    g.bias_pa = uniform(rng) * 100.0f;
+                    g.modulator = uniform(rng) < 0.12f ?
+                        (unsigned char)(1 + randint(rng, 3)) : 0;
+                    initialize_neuron(d, added, child, -1, g, body.neuron_head);
+                    body.neuron_head = added;
+                    ++body.neuron_count;
+                    SynapseGene first = d.synapses[template_e];
+                    SynapseGene second = first;
+                    first.post = added;
+                    second.pre = added;
+                    first.active = second.active = 1;
+                    initialize_synapse(d, incoming, child, first,
+                                       body.synapse_head, rng);
+                    body.synapse_head = incoming;
+                    initialize_synapse(d, outgoing, child, second,
+                                       body.synapse_head, rng);
+                    body.synapse_head = outgoing;
+                    body.synapse_count += 2;
+                    d.animals[child] = body;
+                } else {
+                    if (outgoing >= 0) release_slot(d.synapse_used, outgoing);
+                    if (incoming >= 0) release_slot(d.synapse_used, incoming);
+                    if (added >= 0) release_slot(d.neuron_used, added);
+                }
+            } else if (n >= 0) d.neurons[n].active ^= 1;
+        } else if (choice == 1 && n >= 0) {
+            auto active = d.neurons[n].active;
             unsigned char type = (unsigned char)randint(rng, 2);
-            unsigned char modulator = d.neurons[child * N + n].modulator;
-            d.neurons[child * N + n] = type == 0 ? cortical_l5_profile() : recorded_profile(type);
-            d.neurons[child * N + n].active = active;
-            d.neurons[child * N + n].modulator = modulator;
-        } else if (choice == 2) {
-            auto &g = d.neurons[child * N + n];
+            unsigned char modulator = d.neurons[n].modulator;
+            d.neurons[n] = type == 0 ? cortical_l5_profile() : recorded_profile(type);
+            d.neurons[n].active = active;
+            d.neurons[n].modulator = modulator;
+        } else if (choice == 2 && n >= 0) {
+            auto &g = d.neurons[n];
             g.threshold_mv = clamp(g.threshold_mv + (uniform(rng) - 0.5f) * 2, -60, -35);
             g.bias_pa = clamp(g.bias_pa + (uniform(rng) - 0.5f) * 20, -50, 250);
         } else if (choice == 3) {
-            d.synapses[child * E + e].active ^= 1;
-        } else if (choice == 4) {
-            auto &g = d.synapses[child * E + e];
+            if (uniform(rng) < 0.5f) {
+                int added = claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
+                                       child * 257 + body.synapse_count);
+                if (added >= 0) {
+                    SynapseGene g{};
+                    random_synapse(g, d, child, rng);
+                    initialize_synapse(d, added, child, g, body.synapse_head, rng);
+                    body.synapse_head = added;
+                    ++body.synapse_count;
+                    d.animals[child] = body;
+                }
+            } else if (e >= 0) d.synapses[e].active ^= 1;
+        } else if (choice == 4 && e >= 0) {
+            auto &g = d.synapses[e];
             random_synapse(g, d, child, rng);
-        } else if (choice == 5) {
-            auto &g = d.synapses[child * E + e];
+        } else if (choice == 5 && e >= 0) {
+            auto &g = d.synapses[e];
             g.initial_weight_ns = clamp(g.initial_weight_ns + (uniform(rng) - 0.5f) * 0.5f, 0.1f, 8);
             g.release_sites = (unsigned char)clamp(
                 g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 24);
-        } else if (choice == 6) {
-            auto &g = d.synapses[child * E + e];
+        } else if (choice == 6 && e >= 0) {
+            auto &g = d.synapses[e];
             g.plasticity = (unsigned char)randint(rng, 6);
             g.mod_receptors = g.plasticity == 3 ?
                 (unsigned char)(1 + randint(rng, 3)) :
                 (g.plasticity >= 4 ? MOD_DA : 0);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
-        } else if (choice == 7) {
-            auto &g = d.synapses[child * E + e];
+        } else if (choice == 7 && e >= 0) {
+            auto &g = d.synapses[e];
             g.delay = (unsigned char)(1 + randint(rng, D));
             g.facilitation_ms = g.facilitation_ms == 0
                 ? 500.0f + uniform(rng) * 3500.0f
                 : (uniform(rng) < 0.1f ? 0.0f
                    : clamp(g.facilitation_ms + (uniform(rng) - 0.5f) * 200, 100, 4000));
-            d.neurons[child * N + n].spike_adapt_pa = clamp(
-                d.neurons[child * N + n].spike_adapt_pa + (uniform(rng) - 0.5f) * 5, 0, 150);
-        } else if (choice == 8) {
-            auto &g = d.neurons[child * N + n];
+            if (n >= 0) d.neurons[n].spike_adapt_pa = clamp(
+                d.neurons[n].spike_adapt_pa + (uniform(rng) - 0.5f) * 5, 0, 150);
+        } else if (choice == 8 && n >= 0) {
+            auto &g = d.neurons[n];
             if (g.type == 0) {
                 g.afterdepol_spike_pa = clamp(g.afterdepol_spike_pa +
                     (uniform(rng) - 0.5f) * 20, 0, 200);
                 g.afterdepol_tau_ms = clamp(g.afterdepol_tau_ms +
                     (uniform(rng) - 0.5f) * 10, 10, 150);
             }
-        } else {
-            d.neurons[child * N + n].modulator = (unsigned char)randint(rng, 4);
+        } else if (choice == 9 && n >= 0) {
+            d.neurons[n].modulator = (unsigned char)randint(rng, 4);
         }
     }
 }
@@ -448,41 +668,62 @@ __global__ void reproduce(Device d) {
         if (atomicCAS(&d.animals[candidate].alive, 0, -1) == 0) { child = candidate; break; }
     }
     if (child < 0) { d.animals[a].rng = rng; return; }
-    parent.energy -= 10;
-    parent.rng = rng;
-    d.animals[a] = parent;
     Animal newborn{};
+    newborn.neuron_head = newborn.synapse_head = -1;
+    for (int p = 0; p < S + M; ++p) newborn.ports[p] = -1;
     newborn.x = clamp(parent.x + (uniform(rng) - 0.5f) * 2, 0, W - 0.001f);
     newborn.y = clamp(parent.y + (uniform(rng) - 0.5f) * 2, 0, H - 0.001f);
     newborn.heading = uniform(rng) * 2 * PI;
     newborn.energy = 8;
     newborn.health = 10;
     newborn.generation = parent.generation + 1;
-    newborn.id = atomicAdd(d.next_id, 1);
-    for (int n = 0; n < N; ++n) {
-        d.neurons[child * N + n] = d.neurons[a * N + n];
-        d.neuron_state[child * N + n] = initial_neuron_state(d.neurons[child * N + n]);
-        for (int branch = 0; branch < DENDRITES; ++branch)
-            d.pending_exc[(child * N + n) * DENDRITES + branch] = 0;
-        d.pending_inh[child * N + n] = 0;
-        for (int k = 0; k < 3; ++k)
-            d.mod_event_tick[(child * N + n) * 3 + k] = -1;
-        for (int delay = 0; delay < HISTORY; ++delay)
-            d.spike_history[(delay * P + child) * N + n] = 0;
+    bool complete = true;
+    for (int old = parent.neuron_head; old >= 0; old = d.neuron_next[old]) {
+        int n = claim_slot(d.neuron_used, NEURON_CAPACITY,
+                           child * 131 + newborn.neuron_count);
+        if (n < 0) { complete = false; break; }
+        int port = d.neuron_port[old];
+        initialize_neuron(d, n, child, port, d.neurons[old], newborn.neuron_head);
+        d.neuron_clone[old] = n;
+        newborn.neuron_head = n;
+        ++newborn.neuron_count;
+        if (port >= 0) newborn.ports[port] = n;
     }
-    for (int e = 0; e < E; ++e)
-        d.synapses[child * E + e] = d.synapses[a * E + e];
+    if (complete) for (int old = parent.synapse_head; old >= 0;
+                      old = d.synapse_next[old]) {
+        int e = claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
+                           child * 257 + newborn.synapse_count);
+        if (e < 0) { complete = false; break; }
+        SynapseGene g = d.synapses[old];
+        g.pre = d.neuron_clone[g.pre];
+        g.post = d.neuron_clone[g.post];
+        initialize_synapse(d, e, child, g, newborn.synapse_head, rng);
+        newborn.synapse_head = e;
+        ++newborn.synapse_count;
+    }
+    if (!complete) {
+        release_genome(d, newborn);
+        d.animals[child].alive = 0;
+        d.animals[a].rng = rng;
+        return;
+    }
+    newborn.id = atomicAdd(d.next_id, 1);
+    newborn.alive = -1;
+    d.animals[child] = newborn;
     mutate(d, child, rng);
-    for (int n = 0; n < N; ++n)
-        d.neuron_state[child * N + n] = initial_neuron_state(d.neurons[child * N + n]);
-    for (int e = 0; e < E; ++e)
-        d.synapse_state[child * E + e] = initial_synapse_state(
-            d.synapses[child * E + e], (uint32_t)random64(rng));
+    newborn = d.animals[child];
+    for (int n = newborn.neuron_head; n >= 0; n = d.neuron_next[n])
+        d.neuron_state[n] = initial_neuron_state(d.neurons[n]);
+    for (int e = newborn.synapse_head; e >= 0; e = d.synapse_next[e])
+        d.synapse_state[e] = initial_synapse_state(
+            d.synapses[e], (uint32_t)random64(rng));
     for (int s = 0; s < S; ++s) d.senses[child * S + s] = 0;
     for (int m = 0; m < M; ++m) d.motors[child * M + m] = 0;
     newborn.rng = rng;
-    newborn.alive = -1;
     d.animals[child] = newborn;
+    parent.energy -= 10;
+    parent.rng = rng;
+    d.animals[a] = parent;
     __threadfence();
     atomicExch(&d.animals[child].alive, 1);
     atomicAdd(d.births, 1);
@@ -536,37 +777,47 @@ void write_brains(const std::string &prefix, Device d) {
     std::vector<SynapseGene> synapses;
     std::vector<SynapseState> states;
     std::vector<NeuronState> neuron_states;
+    std::vector<int> neuron_next, synapse_next;
+    std::vector<int> neuron_port;
     download(animals, d.animals, P);
-    download(neurons, d.neurons, P * N);
-    download(synapses, d.synapses, P * E);
-    download(states, d.synapse_state, P * E);
-    download(neuron_states, d.neuron_state, P * N);
+    download(neurons, d.neurons, NEURON_CAPACITY);
+    download(synapses, d.synapses, SYNAPSE_CAPACITY);
+    download(states, d.synapse_state, SYNAPSE_CAPACITY);
+    download(neuron_states, d.neuron_state, NEURON_CAPACITY);
+    download(neuron_next, d.neuron_next, NEURON_CAPACITY);
+    download(synapse_next, d.synapse_next, SYNAPSE_CAPACITY);
+    download(neuron_port, d.neuron_port, NEURON_CAPACITY);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale\n";
-    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors\n";
+    cells << "animal_id,generation,neuron,port,active,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale\n";
+    edges << "animal_id,generation,synapse,active,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
-        for (int n = 0; n < N; ++n) {
-            const auto &g = neurons[a * N + n];
-            if (g.active) cells << animals[a].id << ',' << animals[a].generation << ',' << n << ','
+        for (int n = animals[a].neuron_head, visited = 0;
+             n >= 0 && visited < animals[a].neuron_count;
+             n = neuron_next[n], ++visited) {
+            const auto &g = neurons[n];
+            cells << animals[a].id << ',' << animals[a].generation << ',' << n << ','
+                << neuron_port[n] << ',' << (int)g.active << ','
                 << (int)g.type << ',' << (int)g.modulator << ','
                 << g.capacitance_pf << ',' << g.leak_ns << ','
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
                 << g.reset_mv << ',' << g.bias_pa << ','
                 << g.afterdepol_spike_pa << ',' << g.afterdepol_tau_ms << ','
-                << expf(neuron_states[a * N + n].log_ampa_scale) << '\n';
+                << expf(neuron_states[n].log_ampa_scale) << '\n';
         }
-        for (int e = 0; e < E; ++e) {
-            const auto &g = synapses[a * E + e];
-            if (g.active && neurons[a * N + g.pre].active && neurons[a * N + g.post].active)
-                edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
-                    << g.pre << ',' << g.post << ',' << (int)g.branch << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
-                    << states[a * E + e].weight_ns << ','
-                    << states[a * E + e].spine_volume << ',' << g.utilization << ','
-                    << g.recovery_ms << ',' << g.facilitation_ms << ','
-                    << (int)g.release_sites << ',' << (int)g.plasticity << ','
-                    << (int)g.mod_receptors << '\n';
+        for (int e = animals[a].synapse_head, visited = 0;
+             e >= 0 && visited < animals[a].synapse_count;
+             e = synapse_next[e], ++visited) {
+            const auto &g = synapses[e];
+            edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
+                << (int)g.active << ','
+                << g.pre << ',' << g.post << ',' << (int)g.branch << ','
+                << (int)g.delay << ',' << g.initial_weight_ns << ','
+                << states[e].weight_ns << ',' << states[e].spine_volume << ','
+                << g.utilization << ',' << g.recovery_ms << ','
+                << g.facilitation_ms << ',' << (int)g.release_sites << ','
+                << (int)g.plasticity << ',' << (int)g.mod_receptors << '\n';
         }
     }
 }
@@ -596,17 +847,39 @@ int main(int argc, char **argv) {
     check(cudaGetDeviceCount(&count), "GPU discovery");
     if (count < 1) { std::cerr << "No NVIDIA GPU found\n"; return 1; }
     Device d{};
-    allocate(d.animals, P); allocate(d.neurons, P * N); allocate(d.synapses, P * E);
-    allocate(d.neuron_state, P * N); allocate(d.synapse_state, P * E);
-    allocate(d.pending_exc, P * N * DENDRITES); allocate(d.pending_inh, P * N);
-    allocate(d.mod_event_tick, P * N * 3);
-    allocate(d.spike_history, HISTORY * P * N); allocate(d.senses, P * S);
+    allocate(d.animals, P);
+    allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);
+    allocate(d.neuron_state, NEURON_CAPACITY);
+    allocate(d.synapse_state, SYNAPSE_CAPACITY);
+    allocate(d.neuron_owner, NEURON_CAPACITY);
+    allocate(d.synapse_owner, SYNAPSE_CAPACITY);
+    allocate(d.neuron_next, NEURON_CAPACITY);
+    allocate(d.synapse_next, SYNAPSE_CAPACITY);
+    allocate(d.neuron_port, NEURON_CAPACITY);
+    allocate(d.neuron_clone, NEURON_CAPACITY);
+    allocate(d.neuron_used, NEURON_CAPACITY / 32);
+    allocate(d.synapse_used, SYNAPSE_CAPACITY / 32);
+    allocate(d.active_neuron_counts, P);
+    allocate(d.active_synapse_counts, P);
+    allocate(d.pending_exc, NEURON_CAPACITY * DENDRITES);
+    allocate(d.pending_inh, NEURON_CAPACITY);
+    allocate(d.mod_event_tick, NEURON_CAPACITY * 3);
+    allocate(d.spike_history, HISTORY * NEURON_CAPACITY);
+    allocate(d.senses, P * S);
     allocate(d.motors, P * M); allocate(d.bite_intent, P);
     allocate(d.food, W * H); allocate(d.kind, W * H);
     allocate(d.cell_head, W * H); allocate(d.cell_next, P);
     allocate(d.births, 1); allocate(d.deaths, 1);
     allocate(d.predation_deaths, 1); allocate(d.bites, 1);
     allocate(d.next_id, 1);
+    check(cudaMemset(d.neuron_owner, 0xff,
+                     NEURON_CAPACITY * sizeof(int)), "neuron pool reset");
+    check(cudaMemset(d.synapse_owner, 0xff,
+                     SYNAPSE_CAPACITY * sizeof(int)), "synapse pool reset");
+    check(cudaMemset(d.neuron_used, 0,
+                     NEURON_CAPACITY / 32 * sizeof(uint32_t)), "neuron pool reset");
+    check(cudaMemset(d.synapse_used, 0,
+                     SYNAPSE_CAPACITY / 32 * sizeof(uint32_t)), "synapse pool reset");
     check(cudaMemset(d.births, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.deaths, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.predation_deaths, 0, sizeof(int)), "counter reset");
@@ -620,28 +893,43 @@ int main(int argc, char **argv) {
     check(cudaDeviceSynchronize(), "initialization");
     std::ofstream csv(output);
     if (!csv) { std::cerr << "Cannot open output file\n"; return 1; }
-    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses\n";
+    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots\n";
     std::vector<Animal> bodies;
-    std::vector<NeuronGene> genes;
-    std::vector<SynapseGene> edges;
+    std::vector<int> active_neurons, active_synapses;
     std::vector<int> food;
+    std::vector<uint32_t> neuron_used, synapse_used;
     auto report = [&](int step) {
+        count_brains<<<(P + 127) / 128, 128>>>(d);
         check(cudaDeviceSynchronize(), "simulation step");
         check(cudaGetLastError(), "CUDA kernel");
         download(bodies, d.animals, P);
-        download(genes, d.neurons, P * N);
-        download(edges, d.synapses, P * E);
+        download(active_neurons, d.active_neuron_counts, P);
+        download(active_synapses, d.active_synapse_counts, P);
         download(food, d.food, W * H);
+        download(neuron_used, d.neuron_used, NEURON_CAPACITY / 32);
+        download(synapse_used, d.synapse_used, SYNAPSE_CAPACITY / 32);
         int alive = 0, max_generation = 0, births = 0, deaths = 0;
         int predation_deaths = 0, bites = 0;
         double energy = 0, neurons = 0, synapses = 0;
+        int allocated_neurons = 0, allocated_synapses = 0;
+        int max_neuron_slots = 0, max_synapse_slots = 0;
         for (int a = 0; a < P; ++a) if (bodies[a].alive == 1) {
             ++alive; energy += bodies[a].energy;
             max_generation = std::max(max_generation, bodies[a].generation);
-            for (int n = 0; n < N; ++n) neurons += genes[a * N + n].active;
-            for (int e = 0; e < E; ++e) if (edges[a * E + e].active &&
-                genes[a * N + edges[a * E + e].pre].active &&
-                genes[a * N + edges[a * E + e].post].active) ++synapses;
+            neurons += active_neurons[a];
+            synapses += active_synapses[a];
+            allocated_neurons += bodies[a].neuron_count;
+            allocated_synapses += bodies[a].synapse_count;
+            max_neuron_slots = std::max(max_neuron_slots, bodies[a].neuron_count);
+            max_synapse_slots = std::max(max_synapse_slots, bodies[a].synapse_count);
+        }
+        int occupied_neurons = 0, occupied_synapses = 0;
+        for (uint32_t word : neuron_used) occupied_neurons += __builtin_popcount(word);
+        for (uint32_t word : synapse_used) occupied_synapses += __builtin_popcount(word);
+        if (occupied_neurons != allocated_neurons ||
+            occupied_synapses != allocated_synapses) {
+            std::cerr << "Global pool accounting mismatch at step " << step << '\n';
+            std::exit(1);
         }
         check(cudaMemcpy(&births, d.births, sizeof(int), cudaMemcpyDeviceToHost), "birth count");
         check(cudaMemcpy(&deaths, d.deaths, sizeof(int), cudaMemcpyDeviceToHost), "death count");
@@ -652,7 +940,9 @@ int main(int argc, char **argv) {
             << predation_deaths << ',' << bites << ',' << food_cells << ','
             << max_generation << ','
             << (alive ? energy / alive : 0) << ',' << (alive ? neurons / alive : 0) << ','
-            << (alive ? synapses / alive : 0) << '\n';
+            << (alive ? synapses / alive : 0) << ','
+            << allocated_neurons << ',' << allocated_synapses << ','
+            << max_neuron_slots << ',' << max_synapse_slots << '\n';
         csv.flush();
         std::cout << "step " << step << "  alive " << alive << "  births " << births
                   << "  deaths " << deaths << "  predation " << predation_deaths
@@ -662,16 +952,17 @@ int main(int argc, char **argv) {
     for (int step = 1; step <= steps; ++step) {
         for (int t = 0; t < TICKS; ++t) {
             int tick = (step - 1) * TICKS + t;
-            synapse_delivery<<<(P * E + 255) / 256, 256>>>(d, tick);
-            neuron_step<<<(P * N + 255) / 256, 256>>>(d, tick);
-            synapse_plasticity<<<(P * E + 255) / 256, 256>>>(d, tick);
+            synapse_delivery<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
+            neuron_step<<<(NEURON_CAPACITY + 255) / 256, 256>>>(d, tick);
+            synapse_plasticity<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
         }
         body_step<<<(P + 127) / 128, 128>>>(d);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
         bite_animals<<<(P + 127) / 128, 128>>>(d);
         finish_predation<<<(P + 127) / 128, 128>>>(d);
-        homeostasis_step<<<(P * N + 255) / 256, 256>>>(d);
+        homeostasis_step<<<(NEURON_CAPACITY + 255) / 256, 256>>>(d);
+        reclaim_dead_genomes<<<(P + 127) / 128, 128>>>(d);
         reproduce<<<(P + 127) / 128, 128>>>(d);
         regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed, food_renewal);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
@@ -684,6 +975,11 @@ int main(int argc, char **argv) {
     std::cout << "Wrote " << output << ", world image, and final brain tables\n";
     cudaFree(d.animals); cudaFree(d.neurons); cudaFree(d.synapses);
     cudaFree(d.neuron_state); cudaFree(d.synapse_state);
+    cudaFree(d.neuron_owner); cudaFree(d.synapse_owner);
+    cudaFree(d.neuron_next); cudaFree(d.synapse_next);
+    cudaFree(d.neuron_port); cudaFree(d.neuron_clone);
+    cudaFree(d.neuron_used); cudaFree(d.synapse_used);
+    cudaFree(d.active_neuron_counts); cudaFree(d.active_synapse_counts);
     cudaFree(d.pending_exc); cudaFree(d.pending_inh); cudaFree(d.mod_event_tick);
     cudaFree(d.spike_history);
     cudaFree(d.bite_intent);

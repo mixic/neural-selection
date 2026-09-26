@@ -38,7 +38,7 @@ struct NeuronState {
 };
 struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
-    short pre, post;
+    int pre, post;
     unsigned char delay, active, plasticity, branch, release_sites, mod_receptors;
 };
 struct SynapseState {

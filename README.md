@@ -15,7 +15,7 @@ ctest --test-dir build --output-on-failure
 
 Architecture `86` targets an RTX 3080; change it for another GPU. On this machine, a temporary CUDA 12.9 toolkit under `/tmp/cuda129` was used to build the existing executable because `nvcc` was not installed system-wide. If that toolkit is gone, rebuilding needs another CUDA Toolkit.
 
-Each world step advances the neural simulation by 16 one-millisecond ticks. The program writes population history to the requested CSV, an image to `<output>.png`, and final genomes and synaptic weights to `<output>.neurons.csv` and `<output>.synapses.csv`. White pixels in the image are animals; green, orange, and blue represent the three food types. Runs with the same seed may differ because animals contend for resources and birth slots through GPU atomics.
+Each world step advances the neural simulation by 16 one-millisecond ticks. The program writes population history to the requested CSV, an image to `<output>.png`, and final genomes and synaptic weights to `<output>.neurons.csv` and `<output>.synapses.csv`. The brain tables include allocated inactive genes, global neuron/synapse slot IDs, and fixed port numbers (`-1` means hidden). White pixels in the image are animals; green, orange, and blue represent the three food types. Runs with the same seed may differ because animals contend for resources and birth slots through GPU atomics.
 
 ## Ecology
 
@@ -23,7 +23,7 @@ There are no fixed predator and prey species. Every animal can detect other anim
 
 Each active neuron costs 0.0002 energy per world step, in addition to a 0.003 body upkeep cost and the costs of movement and biting. These are ecological calibration parameters, not fitted neuronal metabolism. At roughly 45 active neurons, total idle upkeep is about the previous 0.012 energy per step, while larger brains now need to earn their extra energy use.
 
-Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the current bite and per-neuron upkeep parameters, a 10,000-step run starting at 512 animals ended with 339 animals and never reached the 2,048-slot safety ceiling. This is an empirical calibration, not a guaranteed equilibrium for every seed or evolved population.
+Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the shared-pool brain layout and current ecological parameters, a 10,000-step run starting at 512 animals ended with 413 animals and never reached the 2,048-slot safety ceiling. This is an empirical calibration, not a guaranteed equilibrium for every seed or evolved population.
 
 ## Neural model
 
@@ -37,7 +37,9 @@ Food renews independently in each empty cell with probability 0.0006 per world s
 - Excitatory pyramidal cells also have a slow postsynaptic AMPA scale shared by their excitatory inputs. Its 48-hour endpoint response is calibrated to [Turrigiano et al. (1998)](https://faculty.washington.edu/somurray/psych545/Turrigiano_Nature_1998.pdf). It changes negligibly in the short world runs shown here.
 - The heritable genome stores initial neuron parameters, cell types, topology, connection strength, delays, and synaptic release parameters. Mutation can add or silence hidden neurons and synapses and alter their parameters. Learning changes current synaptic weights; newborns start from inherited initial strengths.
 
-The body has fixed sensory and motor ports. Brain topology is otherwise arbitrary within 69 neuron and 384 synapse slots per animal. Sixteen sensory and five motor ports leave 48 hidden neuron slots; up to 2048 animals fit in the current storage budget. These fixed per-animal capacities are implementation limits, not imposed brain structures.
+The body has 16 fixed sensory and five fixed motor ports. New animals currently begin with 48 additional hidden neuron genes and 120 synapse genes, but births and mutations allocate from **shared pools of 262,144 neuron and 524,288 synapse slots**. There is no fixed neuron or synapse allotment per animal: a larger brain consumes more of the global budget, and death returns its slots for reuse. The history CSV reports total allocated slots and the largest individual genomes. The current animal-slot ceiling is 2048; ecological pressures generally keep actual population lower.
+
+A 10,000-step GPU run completed with 6,739 births. It checked global occupied-slot counts against the sum of living genomes every 100 steps, and the exported synapses all referenced neurons belonging to the same animal. The largest observed genome grew from its initial 69 neuron and 120 synapse slots to 77 and 136 respectively. This verifies growth and recycling in that run; it does not imply those larger brains learned useful behaviour.
 
 ## Evidence and limits
 
