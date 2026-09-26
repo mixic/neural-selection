@@ -69,6 +69,7 @@ struct LifeRecord {
     float mean_abs_weight_change;
 };
 struct Device {
+    int initial_count;
     Animal *animals;
     NeuronGene *neurons;
     SynapseGene *synapses;
@@ -83,6 +84,7 @@ struct Device {
     int *active_neuron_counts, *active_synapse_counts;
     unsigned char *bite_intent;
     int *motors, *food, *kind, *cell_head, *cell_next;
+    int *founder_motor_steps, *founder_observed_steps;
     int *births, *deaths, *predation_deaths, *bites, *next_id;
     LifeRecord *life_records;
     int *life_count;
@@ -291,9 +293,10 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
             g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 :
                           (u < 0.12f ? 3 : 0));
         }
-        g.bias_pa = port >= S && port < S + M - 1
-            ? 110.0f + uniform(rng) * 90.0f
-            : uniform(rng) * 100.0f;
+        g.bias_pa = port == S ? uniform(rng) * 140.0f :
+            (port > S && port < S + M - 1
+                ? 110.0f + uniform(rng) * 90.0f
+                : uniform(rng) * 100.0f);
         g.active = port >= 0 || uniform(rng) < 0.5f;
         initialize_neuron(d, n, a, port, g, body.neuron_head);
         body.neuron_head = n;
@@ -471,6 +474,12 @@ __global__ void body_step(Device d) {
     float right = d.motors[a * M + 2] / (float)TICKS;
     bool eat = d.motors[a * M + 3] > 0;
     d.bite_intent[a] = d.motors[a * M + 4] > 0;
+    if (b.id < d.initial_count && b.age < 100) {
+        atomicAdd(d.founder_observed_steps, 1);
+        for (int m = 0; m < M; ++m)
+            if (d.motors[a * M + m] > 0)
+                atomicAdd(&d.founder_motor_steps[m], 1);
+    }
     for (int m = 0; m < M; ++m) d.motors[a * M + m] = 0;
     b.heading += (right - left) * 1.2f;
     b.x = clamp(b.x + cosf(b.heading) * thrust * 1.5f, 0, W - 0.001f);
@@ -754,8 +763,12 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             d.neurons[n] = type == 0 ? cortical_l5_profile() : recorded_profile(type);
             d.neurons[n].active = active;
             d.neurons[n].modulator = modulator;
-        } else if (choice == 2 && n >= 0) {
-            auto &g = d.neurons[n];
+        } else if (choice == 2) {
+            // Motor ports stay fixed, but their intrinsic excitability can evolve.
+            int target = uniform(rng) < 0.2f
+                ? body.ports[S + randint(rng, M)] : n;
+            if (target < 0) continue;
+            auto &g = d.neurons[target];
             g.threshold_mv = clamp(g.threshold_mv + (uniform(rng) - 0.5f) * 2, -60, -35);
             g.bias_pa = clamp(g.bias_pa + (uniform(rng) - 0.5f) * 20, -50, 250);
         } else if (choice == 3) {
@@ -1107,6 +1120,7 @@ int main(int argc, char **argv) {
     check(cudaGetDeviceCount(&count), "GPU discovery");
     if (count < 1) { std::cerr << "No NVIDIA GPU found\n"; return 1; }
     Device d{};
+    d.initial_count = initial;
     allocate(d.animals, P);
     allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);
     allocate(d.neuron_state, NEURON_CAPACITY);
@@ -1127,6 +1141,8 @@ int main(int argc, char **argv) {
     allocate(d.spike_history, HISTORY * NEURON_CAPACITY);
     allocate(d.senses, P * S);
     allocate(d.motors, P * M); allocate(d.bite_intent, P);
+    allocate(d.founder_motor_steps, M);
+    allocate(d.founder_observed_steps, 1);
     allocate(d.food, W * H); allocate(d.kind, W * H);
     allocate(d.cell_head, W * H); allocate(d.cell_next, P);
     allocate(d.births, 1); allocate(d.deaths, 1);
@@ -1147,6 +1163,8 @@ int main(int argc, char **argv) {
     check(cudaMemset(d.predation_deaths, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.bites, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.life_count, 0, sizeof(int)), "life record reset");
+    check(cudaMemset(d.founder_motor_steps, 0, M * sizeof(int)), "founder activity reset");
+    check(cudaMemset(d.founder_observed_steps, 0, sizeof(int)), "founder activity reset");
     check(cudaMemcpy(d.next_id, &initial, sizeof(int), cudaMemcpyHostToDevice), "counter init");
     init_world<<<(W * H + 255) / 256, 256>>>(d, seed);
     init_animals<<<(P + 127) / 128, 128>>>(d, initial, seed);
@@ -1160,7 +1178,7 @@ int main(int argc, char **argv) {
     if (!csv || !behavior_csv || !lives_csv) {
         std::cerr << "Cannot open output files\n"; return 1;
     }
-    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots\n";
+    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots,founder_observed_steps,founder_forward_steps,founder_left_steps,founder_right_steps,founder_eat_steps,founder_bite_steps\n";
     behavior_csv << "step";
     write_behavior_header(behavior_csv);
     behavior_csv << '\n';
@@ -1236,6 +1254,12 @@ int main(int argc, char **argv) {
         check(cudaMemcpy(&bites, d.bites, sizeof(int), cudaMemcpyDeviceToHost), "bite count");
         int food_cells = std::count_if(food.begin(), food.end(), [](int amount) { return amount > 0; });
         if (log) {
+            int founder_observed_steps = 0;
+            int founder_motor_steps[M]{};
+            check(cudaMemcpy(&founder_observed_steps, d.founder_observed_steps,
+                             sizeof(int), cudaMemcpyDeviceToHost), "founder activity");
+            check(cudaMemcpy(founder_motor_steps, d.founder_motor_steps,
+                             M * sizeof(int), cudaMemcpyDeviceToHost), "founder activity");
             BehaviorTotals all = dead_totals;
             for (int a = 0; a < P; ++a)
                 if (bodies[a].alive == 1) add_behavior(all, bodies[a].behavior);
@@ -1254,7 +1278,10 @@ int main(int argc, char **argv) {
                 << (alive ? energy / alive : 0) << ',' << (alive ? neurons / alive : 0) << ','
                 << (alive ? synapses / alive : 0) << ','
                 << allocated_neurons << ',' << allocated_synapses << ','
-                << max_neuron_slots << ',' << max_synapse_slots << '\n';
+                << max_neuron_slots << ',' << max_synapse_slots
+                << ',' << founder_observed_steps;
+            for (int m = 0; m < M; ++m) csv << ',' << founder_motor_steps[m];
+            csv << '\n';
             csv.flush();
             std::cout << "step " << step << "  alive " << alive << "  births " << births
                       << "  deaths " << deaths << "  predation " << predation_deaths
@@ -1384,6 +1411,7 @@ int main(int argc, char **argv) {
     cudaFree(d.pending_exc); cudaFree(d.pending_inh); cudaFree(d.mod_event_tick);
     cudaFree(d.spike_history);
     cudaFree(d.bite_intent);
+    cudaFree(d.founder_motor_steps); cudaFree(d.founder_observed_steps);
     cudaFree(d.senses); cudaFree(d.motors);
     cudaFree(d.food); cudaFree(d.kind); cudaFree(d.cell_head); cudaFree(d.cell_next);
     cudaFree(d.births); cudaFree(d.deaths); cudaFree(d.predation_deaths);
