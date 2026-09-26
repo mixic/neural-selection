@@ -1,6 +1,6 @@
 # Neural Selection
 
-A CUDA C++ simulation of animals with evolved spiking brains in a shared 2D world. Animals sense food, hunger, fullness, taste, and injury; move and eat; compete for resources; and reproduce with mutations to their neural genomes. The world supplies no reward or fitness value to the brain. Survival and reproduction follow from body state and resource use.
+A CUDA C++ simulation of animals with evolved spiking brains in a shared 2D world. Animals sense food, nearby animals, hunger, fullness, taste, and injury; move, eat, and bite; compete for resources; and reproduce with mutations to their neural genomes. The world supplies no reward or fitness value to the brain. Survival and reproduction follow from body state and resource use.
 
 ## Build and run
 
@@ -10,12 +10,18 @@ Requires an NVIDIA GPU, CUDA Toolkit with `nvcc`, CMake, a C++ compiler, and lib
 cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build -j
 ctest --test-dir build --output-on-failure
-./build/neural_selection --steps 2000 --population 512 --seed 1 --output run.csv
+./build/neural_selection --steps 2000 --population 512 --seed 1 --food-renewal 0.0006 --output run.csv
 ```
 
 Architecture `86` targets an RTX 3080; change it for another GPU. On this machine, a temporary CUDA 12.9 toolkit under `/tmp/cuda129` was used to build the existing executable because `nvcc` was not installed system-wide. If that toolkit is gone, rebuilding needs another CUDA Toolkit.
 
 Each world step advances the neural simulation by 16 one-millisecond ticks. The program writes population history to the requested CSV, an image to `<output>.png`, and final genomes and synaptic weights to `<output>.neurons.csv` and `<output>.synapses.csv`. White pixels in the image are animals; green, orange, and blue represent the three food types. Runs with the same seed may differ because animals contend for resources and birth slots through GPU atomics.
+
+## Ecology
+
+There are no fixed predator and prey species. Every animal can detect other animals in three directions and has a separate neural bite output. A bite costs energy, injures a co-located animal, and gives that animal a pain signal. A lethal bite transfers 45% of the prey's remaining energy to the attacker and activates a meat-taste signal. Predation therefore transfers existing energy rather than adding a reward signal. Whether animals hunt or avoid others depends on their evolving circuits.
+
+Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the current bite and food parameters, two runs starting at 512 animals had 429 and 446 animals at step 10,000. The second run continued to step 30,000, reaching generation 80; its population stayed between 348 and 508 after step 5,000. All these counts are below the 2,048-slot safety ceiling. This is an empirical calibration, not a guaranteed equilibrium for every seed or evolved population.
 
 ## Neural model
 
@@ -29,7 +35,7 @@ Each world step advances the neural simulation by 16 one-millisecond ticks. The 
 - Excitatory pyramidal cells also have a slow postsynaptic AMPA scale shared by their excitatory inputs. Its 48-hour endpoint response is calibrated to [Turrigiano et al. (1998)](https://faculty.washington.edu/somurray/psych545/Turrigiano_Nature_1998.pdf). It changes negligibly in the short world runs shown here.
 - The heritable genome stores initial neuron parameters, cell types, topology, connection strength, delays, and synaptic release parameters. Mutation can add or silence hidden neurons and synapses and alter their parameters. Learning changes current synaptic weights; newborns start from inherited initial strengths.
 
-The body has fixed sensory and motor ports. Brain topology is otherwise arbitrary within 64 neuron and 384 synapse slots per animal; up to 2048 animals fit in the current storage budget.
+The body has fixed sensory and motor ports. Brain topology is otherwise arbitrary within 69 neuron and 384 synapse slots per animal. Sixteen sensory and five motor ports leave 48 hidden neuron slots; up to 2048 animals fit in the current storage budget. These fixed per-animal capacities are implementation limits, not imposed brain structures.
 
 ## Evidence and limits
 

@@ -15,20 +15,23 @@
 
 namespace sim {
 constexpr int P = 2048;
-constexpr int N = 64;
+constexpr int N = 69;
 constexpr int E = 384;
-constexpr int S = 12;
-constexpr int M = 4;
+constexpr int S = 16;
+constexpr int M = 5;
 constexpr int W = 128;
 constexpr int H = 128;
 constexpr int D = 8;
 constexpr int HISTORY = D + 1;
 constexpr int TICKS = 16;
+constexpr float BITE_DAMAGE = 2.0f;
+constexpr float BITE_ENERGY_COST = 0.02f;
+constexpr float MEAT_ENERGY_FRACTION = 0.45f;
 constexpr float PI = 3.14159265358979323846f;
 
 struct Animal {
     float x, y, heading, energy, health, fullness, pain;
-    float taste[3];
+    float taste[4];
     unsigned long long rng;
     int id, generation, age, alive;
 };
@@ -41,7 +44,9 @@ struct Device {
     float *pending_exc, *pending_inh, *senses;
     int *mod_event_tick;
     unsigned char *spike_history;
-    int *motors, *food, *kind, *births, *deaths, *next_id;
+    unsigned char *bite_intent;
+    int *motors, *food, *kind, *cell_head, *cell_next;
+    int *births, *deaths, *predation_deaths, *bites, *next_id;
 };
 
 __host__ __device__ inline float clamp(float x, float lo, float hi) {
@@ -136,7 +141,7 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
             g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 :
                           (u < 0.12f ? 3 : 0));
         }
-        g.bias_pa = n >= S && n < S + M
+        g.bias_pa = n >= S && n < S + M - 1
             ? 110.0f + uniform(rng) * 90.0f
             : uniform(rng) * 100.0f;
         g.active = (n < S + M || uniform(rng) < 0.5f) ? 1 : 0;
@@ -163,6 +168,13 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
     d.animals[a] = body;
 }
 
+__global__ void index_animals(Device d) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P || d.animals[a].alive != 1) return;
+    int c = cell(d.animals[a].x, d.animals[a].y);
+    d.cell_next[a] = atomicExch(&d.cell_head[c], a);
+}
+
 __global__ void update_senses(Device d) {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= P || d.animals[a].alive != 1) return;
@@ -181,6 +193,20 @@ __global__ void update_senses(Device d) {
     d.senses[a * S + 8] = clamp(b.pain / 3.0f, 0, 1);
     for (int k = 0; k < 3; ++k)
         d.senses[a * S + 9 + k] = clamp(b.taste[k], 0, 1);
+    for (int direction = 0; direction < 3; ++direction) {
+        float angle = b.heading + (direction - 1) * 0.7f;
+        float level = 0;
+        for (int range = 1; range <= 4; ++range) {
+            int c = cell(b.x + cosf(angle) * range,
+                         b.y + sinf(angle) * range);
+            for (int other = d.cell_head[c]; other >= 0;
+                 other = d.cell_next[other])
+                if (other != a && d.animals[other].alive == 1)
+                    level += 0.25f;
+        }
+        d.senses[a * S + 12 + direction] = clamp(level, 0, 1);
+    }
+    d.senses[a * S + 15] = clamp(b.taste[3], 0, 1);
 }
 
 __global__ void synapse_delivery(Device d, int tick) {
@@ -258,11 +284,12 @@ __global__ void synapse_plasticity(Device d, int tick) {
     d.synapse_state[i] = s;
 }
 
-__global__ void regrow(Device d, int step, unsigned long long seed) {
+__global__ void regrow(Device d, int step, unsigned long long seed,
+                       float renewal_probability) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= W * H || d.food[c] != 0) return;
     auto rng = seed_for(seed + step, c);
-    if (uniform(rng) < 0.002f) atomicCAS(&d.food[c], 0, 1);
+    if (uniform(rng) < renewal_probability) atomicCAS(&d.food[c], 0, 1);
 }
 
 __global__ void body_step(Device d) {
@@ -273,14 +300,16 @@ __global__ void body_step(Device d) {
     float left = d.motors[a * M + 1] / (float)TICKS;
     float right = d.motors[a * M + 2] / (float)TICKS;
     bool eat = d.motors[a * M + 3] > 0;
+    d.bite_intent[a] = d.motors[a * M + 4] > 0;
     for (int m = 0; m < M; ++m) d.motors[a * M + m] = 0;
     b.heading += (right - left) * 1.2f;
     b.x = clamp(b.x + cosf(b.heading) * thrust * 1.5f, 0, W - 0.001f);
     b.y = clamp(b.y + sinf(b.heading) * thrust * 1.5f, 0, H - 0.001f);
-    b.energy -= 0.012f + thrust * 0.02f;
+    b.energy -= 0.012f + thrust * 0.02f +
+                (d.bite_intent[a] ? BITE_ENERGY_COST : 0.0f);
     b.fullness = fmaxf(0, b.fullness - 0.05f);
     b.pain *= 0.8f;
-    for (int k = 0; k < 3; ++k) b.taste[k] *= 0.7f;
+    for (int k = 0; k < 4; ++k) b.taste[k] *= 0.7f;
     if (eat) {
         int c = cell(b.x, b.y);
         if (harvest(&d.food[c])) {
@@ -301,6 +330,34 @@ __global__ void body_step(Device d) {
     d.animals[a] = b;
 }
 
+__global__ void bite_animals(Device d) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P || d.animals[a].alive != 1 || !d.bite_intent[a]) return;
+    int c = cell(d.animals[a].x, d.animals[a].y);
+    for (int prey = d.cell_head[c]; prey >= 0; prey = d.cell_next[prey]) {
+        if (prey == a || d.animals[prey].alive != 1) continue;
+        float previous_health = atomicAdd(&d.animals[prey].health, -BITE_DAMAGE);
+        atomicAdd(&d.animals[prey].pain, BITE_DAMAGE);
+        atomicAdd(d.bites, 1);
+        if (previous_health <= BITE_DAMAGE &&
+            atomicCAS(&d.animals[prey].alive, 1, -2) == 1) {
+            atomicAdd(&d.animals[a].energy,
+                      fmaxf(0.0f, d.animals[prey].energy) * MEAT_ENERGY_FRACTION);
+            d.animals[a].taste[3] = 1.0f;
+            atomicAdd(&d.animals[a].fullness, 1.0f);
+        }
+        break;
+    }
+}
+
+__global__ void finish_predation(Device d) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P || d.animals[a].alive != -2) return;
+    d.animals[a].alive = 0;
+    atomicAdd(d.deaths, 1);
+    atomicAdd(d.predation_deaths, 1);
+}
+
 __global__ void homeostasis_step(Device d) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= P * N) return;
@@ -317,7 +374,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
     int mutations = 1 + randint(rng, 4);
     for (int m = 0; m < mutations; ++m) {
         int choice = randint(rng, 10);
-        int n = 16 + randint(rng, N - 16);
+        int n = S + M + randint(rng, N - S - M);
         int e = randint(rng, E);
         if (choice == 0) {
             d.neurons[child * N + n].active ^= 1;
@@ -513,16 +570,22 @@ void write_brains(const std::string &prefix, Device d) {
 int main(int argc, char **argv) {
     using namespace sim;
     int steps = 2000, initial = 1024;
+    float food_renewal = 0.0006f;
     unsigned long long seed = 1;
     std::string output = "run.csv";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--population") && i + 1 < argc) initial = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--food-renewal") && i + 1 < argc)
+            food_renewal = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
-        else { std::cerr << "Usage: neural_selection [--steps N] [--population 1..2048] [--seed N] [--output file.csv]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv]\n"; return 2; }
     }
-    if (steps < 1 || initial < 1 || initial > P) { std::cerr << "Invalid steps or population\n"; return 2; }
+    if (steps < 1 || initial < 1 || initial > P || !std::isfinite(food_renewal) ||
+        food_renewal < 0 || food_renewal > 1) {
+        std::cerr << "Invalid steps, population, or food renewal\n"; return 2;
+    }
     int count = 0;
     check(cudaGetDeviceCount(&count), "GPU discovery");
     if (count < 1) { std::cerr << "No NVIDIA GPU found\n"; return 1; }
@@ -532,29 +595,39 @@ int main(int argc, char **argv) {
     allocate(d.pending_exc, P * N * DENDRITES); allocate(d.pending_inh, P * N);
     allocate(d.mod_event_tick, P * N * 3);
     allocate(d.spike_history, HISTORY * P * N); allocate(d.senses, P * S);
-    allocate(d.motors, P * M);
+    allocate(d.motors, P * M); allocate(d.bite_intent, P);
     allocate(d.food, W * H); allocate(d.kind, W * H);
-    allocate(d.births, 1); allocate(d.deaths, 1); allocate(d.next_id, 1);
+    allocate(d.cell_head, W * H); allocate(d.cell_next, P);
+    allocate(d.births, 1); allocate(d.deaths, 1);
+    allocate(d.predation_deaths, 1); allocate(d.bites, 1);
+    allocate(d.next_id, 1);
     check(cudaMemset(d.births, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.deaths, 0, sizeof(int)), "counter reset");
+    check(cudaMemset(d.predation_deaths, 0, sizeof(int)), "counter reset");
+    check(cudaMemset(d.bites, 0, sizeof(int)), "counter reset");
     check(cudaMemcpy(d.next_id, &initial, sizeof(int), cudaMemcpyHostToDevice), "counter init");
     init_world<<<(W * H + 255) / 256, 256>>>(d, seed);
     init_animals<<<(P + 127) / 128, 128>>>(d, initial, seed);
+    check(cudaMemset(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
+    index_animals<<<(P + 127) / 128, 128>>>(d);
     update_senses<<<(P + 127) / 128, 128>>>(d);
     check(cudaDeviceSynchronize(), "initialization");
     std::ofstream csv(output);
     if (!csv) { std::cerr << "Cannot open output file\n"; return 1; }
-    csv << "step,population,births,deaths,max_generation,mean_energy,mean_neurons,mean_synapses\n";
+    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses\n";
     std::vector<Animal> bodies;
     std::vector<NeuronGene> genes;
     std::vector<SynapseGene> edges;
+    std::vector<int> food;
     auto report = [&](int step) {
         check(cudaDeviceSynchronize(), "simulation step");
         check(cudaGetLastError(), "CUDA kernel");
         download(bodies, d.animals, P);
         download(genes, d.neurons, P * N);
         download(edges, d.synapses, P * E);
+        download(food, d.food, W * H);
         int alive = 0, max_generation = 0, births = 0, deaths = 0;
+        int predation_deaths = 0, bites = 0;
         double energy = 0, neurons = 0, synapses = 0;
         for (int a = 0; a < P; ++a) if (bodies[a].alive == 1) {
             ++alive; energy += bodies[a].energy;
@@ -566,12 +639,18 @@ int main(int argc, char **argv) {
         }
         check(cudaMemcpy(&births, d.births, sizeof(int), cudaMemcpyDeviceToHost), "birth count");
         check(cudaMemcpy(&deaths, d.deaths, sizeof(int), cudaMemcpyDeviceToHost), "death count");
-        csv << step << ',' << alive << ',' << births << ',' << deaths << ',' << max_generation << ','
+        check(cudaMemcpy(&predation_deaths, d.predation_deaths, sizeof(int), cudaMemcpyDeviceToHost), "predation count");
+        check(cudaMemcpy(&bites, d.bites, sizeof(int), cudaMemcpyDeviceToHost), "bite count");
+        int food_cells = std::count_if(food.begin(), food.end(), [](int amount) { return amount > 0; });
+        csv << step << ',' << alive << ',' << births << ',' << deaths << ','
+            << predation_deaths << ',' << bites << ',' << food_cells << ','
+            << max_generation << ','
             << (alive ? energy / alive : 0) << ',' << (alive ? neurons / alive : 0) << ','
             << (alive ? synapses / alive : 0) << '\n';
         csv.flush();
         std::cout << "step " << step << "  alive " << alive << "  births " << births
-                  << "  deaths " << deaths << "  max generation " << max_generation << '\n';
+                  << "  deaths " << deaths << "  predation " << predation_deaths
+                  << "  food " << food_cells << "  max generation " << max_generation << '\n';
     };
     report(0);
     for (int step = 1; step <= steps; ++step) {
@@ -582,9 +661,15 @@ int main(int argc, char **argv) {
             synapse_plasticity<<<(P * E + 255) / 256, 256>>>(d, tick);
         }
         body_step<<<(P + 127) / 128, 128>>>(d);
+        check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
+        index_animals<<<(P + 127) / 128, 128>>>(d);
+        bite_animals<<<(P + 127) / 128, 128>>>(d);
+        finish_predation<<<(P + 127) / 128, 128>>>(d);
         homeostasis_step<<<(P * N + 255) / 256, 256>>>(d);
         reproduce<<<(P + 127) / 128, 128>>>(d);
-        regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed);
+        regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed, food_renewal);
+        check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
+        index_animals<<<(P + 127) / 128, 128>>>(d);
         update_senses<<<(P + 127) / 128, 128>>>(d);
         if (step % 100 == 0 || step == steps) report(step);
     }
@@ -595,6 +680,9 @@ int main(int argc, char **argv) {
     cudaFree(d.neuron_state); cudaFree(d.synapse_state);
     cudaFree(d.pending_exc); cudaFree(d.pending_inh); cudaFree(d.mod_event_tick);
     cudaFree(d.spike_history);
+    cudaFree(d.bite_intent);
     cudaFree(d.senses); cudaFree(d.motors);
-    cudaFree(d.food); cudaFree(d.kind); cudaFree(d.births); cudaFree(d.deaths); cudaFree(d.next_id);
+    cudaFree(d.food); cudaFree(d.kind); cudaFree(d.cell_head); cudaFree(d.cell_next);
+    cudaFree(d.births); cudaFree(d.deaths); cudaFree(d.predation_deaths);
+    cudaFree(d.bites); cudaFree(d.next_id);
 }
