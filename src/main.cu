@@ -384,13 +384,13 @@ __global__ void synapse_delivery(Device d, int64_t tick) {
         d.spike_history[((tick - g.delay) % HISTORY) * NEURON_CAPACITY + g.pre];
     if (state.arrived) {
         NeuronGene source = d.neurons[g.pre];
-        float released = source.type == 0 || source.modulator
+        float released = excitatory_type(source.type) || source.modulator
             ? synapse_release(g, state, tick) : state.weight_ns;
         if (source.modulator) {
             if (released > 0)
                 atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1],
                           static_cast<unsigned long long>(tick + 1));
-        } else if (source.type == 0) {
+        } else if (excitatory_type(source.type)) {
             float postsynaptic_scale = expf(
                 d.neuron_state[g.post].log_ampa_scale);
             atomicAdd(&d.pending_exc[g.post * DENDRITES + g.branch],
@@ -440,9 +440,9 @@ __global__ void synapse_plasticity(Device d, int64_t tick) {
         d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
         !d.neurons[g.post].active) return;
     SynapseState s = d.synapse_state[i];
-    bool excitatory_pair = d.neurons[g.pre].type == 0 &&
+    bool excitatory_pair = excitatory_type(d.neurons[g.pre].type) &&
         d.neurons[g.pre].modulator == 0 &&
-        d.neurons[g.post].type == 0;
+        excitatory_type(d.neurons[g.post].type);
     int target = g.post * 3;
     unsigned char mod_event = 0;
     if (d.mod_event_tick[target] == static_cast<unsigned long long>(tick + 1))
@@ -622,9 +622,9 @@ __global__ void reclaim_dead_genomes(Device d, int64_t step) {
                           d.neurons[g.post].active;
             record.active_synapses += active;
             record.plastic_synapses += active && g.plasticity != 0 &&
-                d.neurons[g.pre].type == 0 &&
+                excitatory_type(d.neurons[g.pre].type) &&
                 d.neurons[g.pre].modulator == 0 &&
-                d.neurons[g.post].type == 0;
+                excitatory_type(d.neurons[g.post].type);
             if (active) total_weight_change +=
                 fabsf(d.synapse_state[e].weight_ns - g.initial_weight_ns);
         }
@@ -727,7 +727,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                             break;
                         }
                     }
-                    unsigned char type = (unsigned char)randint(rng, 4);
+                    unsigned char type = (unsigned char)randint(rng, 5);
                     NeuronGene g = initial_profile(type);
                     g.bias_pa = type >= 2 ? 0.0f : uniform(rng) * 100.0f;
                     g.modulator = uniform(rng) < 0.12f ?
@@ -761,7 +761,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             } else if (n >= 0) d.neurons[n].active ^= 1;
         } else if (choice == 1 && n >= 0) {
             auto active = d.neurons[n].active;
-            unsigned char type = (unsigned char)randint(rng, 4);
+            unsigned char type = (unsigned char)randint(rng, 5);
             unsigned char modulator = d.neurons[n].modulator;
             d.neurons[n] = initial_profile(type);
             d.neurons[n].active = active;
@@ -823,6 +823,15 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 (g.plasticity >= 4 ? MOD_DA : 0);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
+            if (uniform(rng) < 0.15f) {
+                g.slow_recovery_ms = g.slow_recovery_ms == 0 ? 7500.0f :
+                    (uniform(rng) < 0.1f ? 0.0f :
+                     clamp(g.slow_recovery_ms + (uniform(rng) - 0.5f) * 500,
+                           1000.0f, 20000.0f));
+                g.slow_depletion = g.slow_recovery_ms == 0 ? 0.0f :
+                    clamp(g.slow_depletion + (uniform(rng) - 0.5f) * 0.01f,
+                          0.0f, 0.1f);
+            }
         } else if (choice == 7 && e >= 0) {
             auto &g = d.synapses[e];
             g.delay = (unsigned char)(1 + randint(rng, D));

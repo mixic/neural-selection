@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -23,8 +24,8 @@ static SynapseGene generic_synapse(float weight_ns) {
 
 struct SingleResponse { double epsc_pa, epsp_mv, cv; };
 
-static SingleResponse single_axon(SynapseGene synapse, int trials = 1000) {
-    auto cell = cortical_l5_profile();
+static SingleResponse single_axon(SynapseGene synapse, int trials = 1000,
+                                  NeuronGene cell = cortical_l5_profile()) {
     double current_sum = 0, voltage_sum = 0, current_sq_sum = 0;
     for (int trial = 1; trial <= trials; ++trial) {
         auto state = initial_neuron_state(cell);
@@ -103,8 +104,8 @@ static int sensory_spikes(float sense, float bias_pa = 0,
 // Independent inputs with fixed spike times provide a convergence check.
 // Each axon has its own release state, as in the GPU world.
 static int convergent_spikes(int inputs, int rate_hz, SynapseGene gene,
-                            int duration_ms = 500) {
-    auto cell = cortical_l5_profile();
+                            int duration_ms = 500,
+                            NeuronGene cell = cortical_l5_profile()) {
     auto state = initial_neuron_state(cell);
     std::vector<SynapseState> axons;
     for (int i = 0; i < inputs; ++i)
@@ -122,15 +123,15 @@ static int convergent_spikes(int inputs, int rate_hz, SynapseGene gene,
     return state.total_spikes;
 }
 
-struct OdorResponse { int baseline_spikes, odor_spikes; };
+struct OdorResponse { int baseline_spikes, odor_spikes, onset_spikes, late_spikes; };
 
-static OdorResponse odor_step(int inputs, int odor_hz, SynapseGene gene) {
-    auto cell = cortical_l5_profile();
+static OdorResponse odor_step(int inputs, int odor_hz, SynapseGene gene,
+                             NeuronGene cell = cortical_l5_profile()) {
     auto state = initial_neuron_state(cell);
     std::vector<SynapseState> axons;
     for (int i = 0; i < inputs; ++i)
         axons.push_back(initial_synapse_state(gene, i + 1));
-    int baseline_spikes = 0, odor_spikes = 0;
+    int baseline_spikes = 0, odor_spikes = 0, onset_spikes = 0, late_spikes = 0;
     for (int t = 0; t < 4500; ++t) {
         bool odor = t >= 4000;
         int rate = odor ? odor_hz : 7;
@@ -144,9 +145,27 @@ static OdorResponse odor_step(int inputs, int odor_hz, SynapseGene gene) {
         }
         neuron_advance(cell, state, 0, excitation, 0);
         if (state.spike && t >= 3500 && t < 4000) ++baseline_spikes;
-        if (state.spike && odor) ++odor_spikes;
+        if (state.spike && odor) {
+            ++odor_spikes;
+            if (t < 4100) ++onset_spikes;
+            if (t >= 4400) ++late_spikes;
+        }
     }
-    return {baseline_spikes, odor_spikes};
+    return {baseline_spikes, odor_spikes, onset_spikes, late_spikes};
+}
+
+static int synchronous_spikes(int inputs, SynapseGene gene, NeuronGene cell) {
+    auto state = initial_neuron_state(cell);
+    float excitation[DENDRITES]{};
+    for (int i = 0; i < inputs; ++i) {
+        auto axon = initial_synapse_state(gene, i + 1);
+        excitation[i % DENDRITES] += synapse_release(gene, axon, 0);
+    }
+    for (int t = 0; t < 50; ++t) {
+        neuron_advance(cell, state, 0, excitation, 0);
+        std::fill_n(excitation, DENDRITES, 0.0f);
+    }
+    return state.total_spikes;
 }
 
 int main() {
@@ -173,8 +192,10 @@ int main() {
     // approximately 40% depression after sustained 7 Hz stimulation.
     auto orn = generic_synapse(29.0f / (65.0f * 0.75f));
     orn.utilization = 0.75f;
-    orn.recovery_ms = 170.0f;
+    orn.recovery_ms = 50.0f;
     orn.release_sites = 50;
+    orn.slow_recovery_ms = 7500.0f;
+    orn.slow_depletion = 0.023f;
     auto orn_single = single_axon(orn);
     auto orn_train = train(orn, 50);
     std::cout << "orn_pn_candidate epsc_pa=" << orn_single.epsc_pa
@@ -182,7 +203,8 @@ int main() {
               << " current_cv=" << orn_single.cv
               << " basal_ratio=" << orn_train.basal_end_pa / orn_train.first_pa
               << " challenge_last_pa=" << orn_train.challenge_last_pa
-              << " recovery_1s=" << recovery_after_pause(orn, 1000) << '\n';
+              << " recovery_1s=" << recovery_after_pause(orn, 1000)
+              << " recovery_7p5s=" << recovery_after_pause(orn, 7500) << '\n';
     for (float bias : {0.0f, 50.0f, 100.0f})
         for (float level : {0.0f, 0.125f, 0.25f, 0.5f, 1.0f})
             std::cout << "sensory_bias_" << bias << "_level_" << level
@@ -198,5 +220,51 @@ int main() {
         std::cout << "orn_odor_" << inputs << "x" << hz
                   << "Hz pn_baseline_hz=" << response.baseline_spikes * 2
                   << " pn_odor_hz=" << response.odor_spikes * 2 << '\n';
+    }
+    // Effective point PN. Its capacitance is fitted to the unitary EPSP;
+    // the sweep displays how sensitive relay behavior is to that fit.
+    for (float capacitance : {7.0f, 8.0f, 8.7f, 10.0f, 12.0f}) {
+        auto pn = pn_relay_profile();
+        pn.capacitance_pf = capacitance;
+        pn.leak_ns = capacitance / 12.0f;
+        auto pn_orn = orn;
+        pn_orn.initial_weight_ns = 29.0f / (60.0f * 0.75f);
+        auto pulse = single_axon(pn_orn, 1000, pn);
+        auto driven = odor_step(32, 20, pn_orn, pn);
+        auto driven_40 = odor_step(40, 20, pn_orn, pn);
+        auto driven_64 = odor_step(64, 20, pn_orn, pn);
+        std::cout << "reduced_pn_C_" << capacitance
+                  << " one_epsp_mv=" << pulse.epsp_mv
+                  << " baseline_hz=" << driven.baseline_spikes * 2
+                  << " odor_hz=" << driven.odor_spikes * 2
+                  << " odor_40_hz=" << driven_40.odor_spikes * 2
+                  << " odor_64_hz=" << driven_64.odor_spikes * 2 << '\n';
+    }
+    auto pn = pn_relay_profile();
+    orn.initial_weight_ns = 29.0f / (60.0f * 0.75f);
+    for (int inputs : {1, 2, 3, 4})
+        std::cout << "pn_synchronous_" << inputs << " spikes="
+                  << synchronous_spikes(inputs, orn, pn) << '\n';
+    for (int hz : {7, 10, 20, 50}) {
+        auto response = odor_step(40, hz, orn, pn);
+        std::cout << "pn_40_orn_" << hz << "Hz baseline_hz="
+                  << response.baseline_spikes * 2
+                  << " odor_hz=" << response.odor_spikes * 2
+                  << " onset_hz=" << response.onset_spikes * 10
+                  << " late_hz=" << response.late_spikes * 10 << '\n';
+    }
+    auto pn_pulse = single_axon(orn, 1000, pn);
+    auto basal = train(orn, 20);
+    auto weak = odor_step(40, 20, orn, pn);
+    auto strong = odor_step(40, 50, orn, pn);
+    bool reproduced = std::abs(pn_pulse.epsc_pa - 29.0) < 2.6 &&
+        std::abs(pn_pulse.epsp_mv - 6.19) < 0.45 &&
+        std::abs(basal.basal_end_pa / basal.first_pa - 0.60) < 0.08 &&
+        std::abs(recovery_after_pause(orn, 7500) - 0.85) < 0.06 &&
+        weak.odor_spikes > weak.baseline_spikes &&
+        strong.onset_spikes > strong.late_spikes;
+    if (!reproduced) {
+        std::cerr << "ORN-to-PN relay protocol regression\n";
+        return EXIT_FAILURE;
     }
 }

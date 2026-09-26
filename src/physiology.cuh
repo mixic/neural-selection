@@ -46,6 +46,8 @@ struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
     int pre, post;
     unsigned char delay, active, plasticity, branch, release_sites, mod_receptors;
+    // Optional slow component of observed use-dependent depression. Zero is off.
+    float slow_recovery_ms, slow_depletion;
 };
 struct SynapseState {
     float weight_ns, running_utilization, pre_trace, post_trace;
@@ -56,6 +58,7 @@ struct SynapseState {
     uint64_t ready_mask;
     uint32_t rng_state;
     unsigned char arrived;
+    float slow_resource;
 };
 
 NS_HD inline float bound(float x, float low, float high) {
@@ -93,10 +96,31 @@ NS_HD inline NeuronGene crab_pacemaker_profile() {
     return g;
 }
 
+// Effective PN relay profile for the ORN-to-PN protocol. Capacitance and leak
+// are fitted to the published unitary EPSP and the author's passive-model
+// decay; they are not measurements of a physical PN compartment.
+NS_HD inline NeuronGene pn_relay_profile() {
+    NeuronGene g = recorded_profile(0);
+    g.type = 4;
+    g.capacitance_pf = 8.7f;
+    g.leak_ns = 8.7f / 12.0f;
+    g.rest_mv = -60.0f;
+    g.threshold_mv = -40.0f;
+    g.reset_mv = -60.0f;
+    g.adapt_ns = 0;
+    g.spike_adapt_pa = 0;
+    return g;
+}
+
+NS_HD inline bool excitatory_type(unsigned char type) {
+    return type == 0 || type == 4;
+}
+
 NS_HD inline NeuronGene initial_profile(unsigned char type) {
     return type == 0 ? cortical_l5_profile() :
            (type == 1 ? recorded_profile(1) :
-            (type == 2 ? lobster_lp_profile() : crab_pacemaker_profile()));
+           (type == 2 ? lobster_lp_profile() :
+            (type == 3 ? crab_pacemaker_profile() : pn_relay_profile())));
 }
 
 
@@ -252,7 +276,7 @@ NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
     return {g.initial_weight_ns, 0, 0, 0, 0, 0, -1, 1, -1,
             1000000, 1000000,
             -1000000, site_count(g) == 64 ? ~uint64_t(0) :
-            (uint64_t(1) << site_count(g)) - 1, x, 0};
+            (uint64_t(1) << site_count(g)) - 1, x, 0, 1};
 }
 
 // Fitted temporal envelope for dopamine-sensitive eligibility at striatal
@@ -281,6 +305,9 @@ NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int64_
         recovery_probability = 1.0f - expf(-elapsed / g.recovery_ms);
         if (g.facilitation_ms > 0)
             s.running_utilization *= expf(-elapsed / g.facilitation_ms);
+        if (g.slow_recovery_ms > 0)
+            s.slow_resource = 1.0f -
+                (1.0f - s.slow_resource) * expf(-elapsed / g.slow_recovery_ms);
     }
     s.running_utilization = g.facilitation_ms > 0
         ? s.running_utilization + g.utilization * (1.0f - s.running_utilization)
@@ -296,7 +323,10 @@ NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int64_
         }
     }
     s.last_arrival_tick = tick;
-    return s.weight_ns * released / site_count(g);
+    float output = s.weight_ns * released / site_count(g) * s.slow_resource;
+    if (g.slow_recovery_ms > 0)
+        s.slow_resource *= 1.0f - g.slow_depletion;
+    return output;
 }
 
 // Plasticity profile 1: cultured hippocampal pairs in Bi and Poo (1998).
