@@ -535,6 +535,47 @@ __global__ void count_brains(Device d) {
     d.active_synapse_counts[a] = synapses;
 }
 
+__device__ void remove_synapse(Device d, Animal &body, int target) {
+    int previous = -1;
+    for (int e = body.synapse_head; e >= 0; e = d.synapse_next[e]) {
+        if (e != target) {
+            previous = e;
+            continue;
+        }
+        int next = d.synapse_next[e];
+        if (previous < 0) body.synapse_head = next;
+        else d.synapse_next[previous] = next;
+        --body.synapse_count;
+        d.synapse_owner[e] = -1;
+        release_slot(d.synapse_used, e);
+        return;
+    }
+}
+
+__device__ void remove_hidden_neuron(Device d, Animal &body, int target) {
+    if (target < 0 || d.neuron_port[target] >= 0) return;
+    for (int e = body.synapse_head; e >= 0;) {
+        int next = d.synapse_next[e];
+        SynapseGene g = d.synapses[e];
+        if (g.pre == target || g.post == target) remove_synapse(d, body, e);
+        e = next;
+    }
+    int previous = -1;
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n]) {
+        if (n != target) {
+            previous = n;
+            continue;
+        }
+        int next = d.neuron_next[n];
+        if (previous < 0) body.neuron_head = next;
+        else d.neuron_next[previous] = next;
+        --body.neuron_count;
+        d.neuron_owner[n] = -1;
+        release_slot(d.neuron_used, n);
+        return;
+    }
+}
+
 __device__ void mutate(Device d, int child, unsigned long long &rng) {
     int mutations = 1 + randint(rng, 4);
     for (int m = 0; m < mutations; ++m) {
@@ -544,7 +585,8 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
         int e = body.synapse_count ?
             synapse_at(d, body, randint(rng, body.synapse_count)) : -1;
         if (choice == 0) {
-            if (uniform(rng) < 0.5f) {
+            float action = uniform(rng);
+            if (action < 1.0f / 3.0f) {
                 int added = claim_slot(d.neuron_used, NEURON_CAPACITY,
                                        child * 131 + body.neuron_count);
                 int incoming = added >= 0 ?
@@ -592,6 +634,11 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                     if (incoming >= 0) release_slot(d.synapse_used, incoming);
                     if (added >= 0) release_slot(d.neuron_used, added);
                 }
+            } else if (action < 2.0f / 3.0f) {
+                if (n >= 0) {
+                    remove_hidden_neuron(d, body, n);
+                    d.animals[child] = body;
+                }
             } else if (n >= 0) d.neurons[n].active ^= 1;
         } else if (choice == 1 && n >= 0) {
             auto active = d.neurons[n].active;
@@ -605,7 +652,8 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             g.threshold_mv = clamp(g.threshold_mv + (uniform(rng) - 0.5f) * 2, -60, -35);
             g.bias_pa = clamp(g.bias_pa + (uniform(rng) - 0.5f) * 20, -50, 250);
         } else if (choice == 3) {
-            if (uniform(rng) < 0.5f) {
+            float action = uniform(rng);
+            if (action < 1.0f / 3.0f) {
                 int added = claim_slot(d.synapse_used, SYNAPSE_CAPACITY,
                                        child * 257 + body.synapse_count);
                 if (added >= 0) {
@@ -614,6 +662,11 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                     initialize_synapse(d, added, child, g, body.synapse_head, rng);
                     body.synapse_head = added;
                     ++body.synapse_count;
+                    d.animals[child] = body;
+                }
+            } else if (action < 2.0f / 3.0f) {
+                if (e >= 0) {
+                    remove_synapse(d, body, e);
                     d.animals[child] = body;
                 }
             } else if (e >= 0) d.synapses[e].active ^= 1;
