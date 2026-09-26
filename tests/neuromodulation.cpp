@@ -34,6 +34,30 @@ CorticalResult cortical_eligibility(unsigned char modulator, int delay_ms,
     return {forward.weight_ns, reverse.weight_ns};
 }
 
+// Shindou et al. (2019): 60 corticostriatal pairings at 0.1 Hz, with one
+// EPSP 10 ms before a three-spike postsynaptic burst at 100 Hz.
+float striatal_eligibility(int dopamine_offset_ms, bool l_type_available,
+                          bool nmda_available = true,
+                          unsigned char receptors = MOD_DA,
+                          bool calcium_permeable_ampa_available = true) {
+    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 4, 0, 14};
+    gene.mod_receptors = receptors;
+    SynapseState synapse = initial_synapse_state(gene);
+    for (int t = 0; t < 600000; ++t) {
+        int phase = t % 10000;
+        bool pre = phase == 0;
+        bool post = phase == 10 || phase == 20 || phase == 30;
+        int mod_phase = dopamine_offset_ms < 0 ?
+                        10000 + dopamine_offset_ms : dopamine_offset_ms;
+        unsigned char event = dopamine_offset_ms != -100000 &&
+                              phase == mod_phase ? MOD_DA : 0;
+        synapse_plasticity_step(gene, synapse, pre, post, true, 0,
+                                nmda_available, event, l_type_available,
+                                calcium_permeable_ampa_available);
+    }
+    return synapse.weight_ns;
+}
+
 int main() {
     int failures = 0;
     auto require = [&](bool ok, const char *message) {
@@ -65,5 +89,38 @@ int main() {
               << ", 5HT " << serotonin.pre_post << '/' << serotonin.post_pre
               << ", delayed NE/5HT " << late_ne.pre_post << '/'
               << late_serotonin.post_pre << '\n';
+    float striatum_alone = striatal_eligibility(-100000, true);
+    float striatum_nimo = striatal_eligibility(-100000, false);
+    float striatum_early = striatal_eligibility(-2000, false);
+    float striatum_zero = striatal_eligibility(0, false);
+    float striatum_two = striatal_eligibility(2000, false);
+    float striatum_four = striatal_eligibility(4000, false);
+    float striatum_two_no_nimo = striatal_eligibility(2000, true);
+    float striatum_nmda_blocked = striatal_eligibility(2000, false, false);
+    float striatum_d1_blocked = striatal_eligibility(2000, false, true, 0);
+    float striatum_ampa_blocked = striatal_eligibility(2000, false, true,
+                                                       MOD_DA, false);
+    require(striatum_alone > 0.62f && striatum_alone < 0.74f,
+            "D1 pre-post pairing should produce LTD without dopamine");
+    require(std::abs(striatum_nimo - 1) < 1e-5f,
+            "blocking L-type calcium current should remove competing LTD");
+    require(striatum_two > 1.18f && striatum_two < 1.36f,
+            "dopamine two seconds after pairing should unmask LTP");
+    require(striatum_early < 1.08f && striatum_zero < 1.08f &&
+            striatum_four < 1.10f,
+            "early, simultaneous, and four-second dopamine should not potentiate strongly");
+    require(striatum_two_no_nimo > striatum_alone + 0.18f &&
+            striatum_two_no_nimo < 1.1f,
+            "delayed dopamine should counteract LTD when L-type channels remain open");
+    require(striatum_nmda_blocked > 1.18f &&
+            std::abs(striatum_d1_blocked - 1) < 1e-5f &&
+            std::abs(striatum_ampa_blocked - 1) < 1e-5f,
+            "striatal LTP should require D1 and calcium-permeable AMPA, not NMDA");
+    std::cout << "Shindou 2019: pairing alone " << striatum_alone
+              << ", nimodipine " << striatum_nimo
+              << ", DA at -2/0/+2/+4 s " << striatum_early << '/'
+              << striatum_zero << '/' << striatum_two << '/'
+              << striatum_four << ", +2 s no nimodipine "
+              << striatum_two_no_nimo << '\n';
     return failures ? 1 : 0;
 }

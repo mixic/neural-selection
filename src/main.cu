@@ -104,8 +104,11 @@ __device__ void random_synapse(SynapseGene &g, Device d, int animal,
         g.recovery_ms = 30.0f;
         g.facilitation_ms = 1700.0f;
     }
-    g.plasticity = uniform(rng) < 0.1f ? 3 : 2;
-    g.mod_receptors = g.plasticity == 3 ? MOD_NE | MOD_5HT : 0;
+    float plasticity_draw = uniform(rng);
+    g.plasticity = plasticity_draw < 0.05f ? 4 :
+                   (plasticity_draw < 0.15f ? 3 : 2);
+    g.mod_receptors = g.plasticity == 3 ? MOD_NE | MOD_5HT :
+                      (g.plasticity == 4 ? MOD_DA : 0);
     g.active = 1;
 }
 
@@ -129,7 +132,8 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
         NeuronGene g = type == 0 ? cortical_l5_profile() : recorded_profile(type);
         if (n >= S + M) {
             float u = uniform(rng);
-            g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 : 0);
+            g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 :
+                          (u < 0.12f ? 3 : 0));
         }
         g.bias_pa = n >= S && n < S + M
             ? 110.0f + uniform(rng) * 90.0f
@@ -339,9 +343,10 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 24);
         } else if (choice == 6) {
             auto &g = d.synapses[child * E + e];
-            g.plasticity = (unsigned char)randint(rng, 4);
+            g.plasticity = (unsigned char)randint(rng, 5);
             g.mod_receptors = g.plasticity == 3 ?
-                (unsigned char)(1 + randint(rng, 3)) : 0;
+                (unsigned char)(1 + randint(rng, 3)) :
+                (g.plasticity == 4 ? MOD_DA : 0);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
         } else if (choice == 7) {
@@ -362,7 +367,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                     (uniform(rng) - 0.5f) * 10, 10, 150);
             }
         } else {
-            d.neurons[child * N + n].modulator = (unsigned char)randint(rng, 3);
+            d.neurons[child * N + n].modulator = (unsigned char)randint(rng, 4);
         }
     }
 }

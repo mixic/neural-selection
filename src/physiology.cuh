@@ -43,7 +43,7 @@ struct SynapseGene {
 };
 struct SynapseState {
     float weight_ns, running_utilization, pre_trace, post_trace;
-    float eligible_ltp, eligible_ltd;
+    float eligible_ltp, eligible_ltd, da_age_ms;
     float pre_age_ms, post_age_ms;
     int last_arrival_tick;
     uint32_t ready_mask, rng_state;
@@ -173,8 +173,16 @@ NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
     x ^= x >> 15; x *= 0x846ca68bu;
     x ^= x >> 16;
     if (!x) x = 1;
-    return {g.initial_weight_ns, 0, 0, 0, 0, 0, 1000000, 1000000,
+    return {g.initial_weight_ns, 0, 0, 0, 0, 0, -1, 1000000, 1000000,
             -1000000, (1u << site_count(g)) - 1u, x, 0};
+}
+
+// Fitted temporal envelope for dopamine-sensitive eligibility at striatal
+// D1-like synapses in Shindou et al. (2019). The molecular state is unresolved.
+NS_HD inline float delayed_da_eligibility(float age_ms) {
+    if (age_ms < 0 || age_ms > 20000.0f) return 0;
+    float x = age_ms / 2000.0f;
+    return x * x * x * x * expf(4.0f * (1.0f - x));
 }
 
 // Resource depletion (Tsodyks and Markram 1997), plus the pulse-driven
@@ -213,8 +221,35 @@ NS_HD inline void synapse_plasticity_step(const SynapseGene &g, SynapseState &s,
                                          bool excitatory_pair,
                                          float preceding_depol_mv = 0,
                                          bool nmda_available = true,
-                                         unsigned char mod_event = 0) {
-    if (!g.plasticity || !excitatory_pair || !nmda_available) return;
+                                         unsigned char mod_event = 0,
+                                         bool l_type_available = true,
+                                         bool calcium_permeable_ampa_available = true) {
+    if (!g.plasticity || !excitatory_pair) return;
+    if (g.plasticity == 4) {
+        // D1 striatal profile: pre/post conjunction creates a delayed silent
+        // dopamine eligibility state and a competing L-type-dependent LTD.
+        if (s.da_age_ms >= 0) {
+            s.da_age_ms += DT_MS;
+            if (s.da_age_ms > 20000.0f) s.da_age_ms = -1;
+        }
+        s.pre_age_ms += DT_MS;
+        if (arrived) s.pre_age_ms = 0;
+        if (postsynaptic_spike && s.pre_age_ms <= 15.0f &&
+            (s.da_age_ms < 0 || s.da_age_ms > 30.0f)) {
+            s.da_age_ms = 0;
+            if (l_type_available)
+                s.weight_ns -= 0.005383f * g.initial_weight_ns;
+        }
+        if ((mod_event & MOD_DA) && (g.mod_receptors & MOD_DA) &&
+            calcium_permeable_ampa_available) {
+            s.weight_ns += 0.00453f * delayed_da_eligibility(s.da_age_ms)
+                           * g.initial_weight_ns;
+            s.da_age_ms = -1;
+        }
+        s.weight_ns = bound(s.weight_ns, 0.0f, 2.0f * g.initial_weight_ns);
+        return;
+    }
+    if (!nmda_available) return;
     if (g.plasticity == 3) {
         // He et al. (2015): activity leaves distinct silent LTP/LTD traces.
         // In this visual-cortex profile, local beta2-adrenergic and 5-HT2C
