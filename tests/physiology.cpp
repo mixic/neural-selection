@@ -229,6 +229,35 @@ int main() {
     std::cout << "Cortical train weights: depolarized 40 Hz " << burst_weight
               << " (" << burst_spikes << " evoked), 0.1 Hz " << sparse_weight
               << " (" << sparse_spikes << " evoked)\n";
+
+    NeuronGene pyramid = recorded_profile(0);
+    NeuronGene interneuron = recorded_profile(1);
+    auto quiet_homeo = initial_neuron_state(pyramid);
+    auto control_homeo = initial_neuron_state(pyramid);
+    auto active_homeo = initial_neuron_state(pyramid);
+    auto inhibitory_homeo = initial_neuron_state(interneuron);
+    for (int hour = 0; hour < 48; ++hour) {
+        homeostatic_advance(pyramid, quiet_homeo, 3600000.0f, 0.0f);
+        homeostatic_advance(pyramid, control_homeo, 3600000.0f, 0.4f);
+        homeostatic_advance(pyramid, active_homeo, 3600000.0f, 1.06f);
+        homeostatic_advance(interneuron, inhibitory_homeo, 3600000.0f, 0.0f);
+    }
+    float quiet_scale = std::exp(quiet_homeo.log_ampa_scale);
+    float control_scale = std::exp(control_homeo.log_ampa_scale);
+    float active_scale = std::exp(active_homeo.log_ampa_scale);
+    float inhibitory_scale = std::exp(inhibitory_homeo.log_ampa_scale);
+    require(std::abs(quiet_scale - 1.92f) < 0.02f,
+            "48-hour activity blockade should increase pyramidal AMPA amplitude");
+    require(std::abs(active_scale - 0.70f) < 0.02f,
+            "48-hour elevated firing should decrease pyramidal AMPA amplitude");
+    require(std::abs(control_scale - 1) < 1e-5f &&
+            std::abs(inhibitory_scale - 1) < 1e-5f,
+            "control activity and inhibitory cells should not scale in this protocol");
+    require(std::abs((2.0f * quiet_scale) / (0.5f * quiet_scale) - 4) < 1e-5f,
+            "homeostatic scaling should preserve relative synaptic strengths");
+    std::cout << "48-hour AMPA scales: silent " << quiet_scale
+              << ", control " << control_scale << ", elevated " << active_scale
+              << ", interneuron " << inhibitory_scale << '\n';
     if (failures) return 1;
     std::cout << "All physiology protocol checks passed\n";
 }

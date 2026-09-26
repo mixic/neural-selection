@@ -183,8 +183,12 @@ __global__ void synapse_delivery(Device d, int tick) {
     if (state.arrived) {
         float released = d.neurons[a * N + g.pre].type == 0
             ? synapse_release(g, state, tick) : state.weight_ns;
-        if (d.neurons[a * N + g.pre].type == 0)
-            atomicAdd(&d.pending_exc[(a * N + g.post) * DENDRITES + g.branch], released);
+        if (d.neurons[a * N + g.pre].type == 0) {
+            float postsynaptic_scale = expf(
+                d.neuron_state[a * N + g.post].log_ampa_scale);
+            atomicAdd(&d.pending_exc[(a * N + g.post) * DENDRITES + g.branch],
+                      released * postsynaptic_scale);
+        }
         else
             atomicAdd(&d.pending_inh[a * N + g.post], released);
     }
@@ -272,6 +276,18 @@ __global__ void body_step(Device d) {
         atomicAdd(d.deaths, 1);
     }
     d.animals[a] = b;
+}
+
+__global__ void homeostasis_step(Device d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= P * N) return;
+    int a = i / N;
+    if (d.animals[a].alive != 1 || !d.neurons[i].active) return;
+    NeuronState state = d.neuron_state[i];
+    float elapsed_ms = fmaxf(16.0f, d.animals[a].age * 16.0f);
+    float observed_hz = state.total_spikes * 1000.0f / elapsed_ms;
+    homeostatic_advance(d.neurons[i], state, 16.0f, observed_hz);
+    d.neuron_state[i] = state;
 }
 
 __device__ void mutate(Device d, int child, unsigned long long &rng) {
@@ -415,13 +431,15 @@ void write_brains(const std::string &prefix, Device d) {
     std::vector<NeuronGene> neurons;
     std::vector<SynapseGene> synapses;
     std::vector<SynapseState> states;
+    std::vector<NeuronState> neuron_states;
     download(animals, d.animals, P);
     download(neurons, d.neurons, P * N);
     download(synapses, d.synapses, P * E);
     download(states, d.synapse_state, P * E);
+    download(neuron_states, d.neuron_state, P * N);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa\n";
+    cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,ampa_scale\n";
     edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,release_sites,plasticity\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
@@ -430,7 +448,8 @@ void write_brains(const std::string &prefix, Device d) {
                 << (int)g.type << ',' << g.capacitance_pf << ',' << g.leak_ns << ','
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
-                << g.reset_mv << ',' << g.bias_pa << '\n';
+                << g.reset_mv << ',' << g.bias_pa << ','
+                << expf(neuron_states[a * N + n].log_ampa_scale) << '\n';
         }
         for (int e = 0; e < E; ++e) {
             const auto &g = synapses[a * E + e];
@@ -517,6 +536,7 @@ int main(int argc, char **argv) {
             synapse_plasticity<<<(P * E + 255) / 256, 256>>>(d);
         }
         body_step<<<(P + 127) / 128, 128>>>(d);
+        homeostasis_step<<<(P * N + 255) / 256, 256>>>(d);
         reproduce<<<(P + 127) / 128, 128>>>(d);
         regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed);
         update_senses<<<(P + 127) / 128, 128>>>(d);

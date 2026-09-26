@@ -27,8 +27,9 @@ struct NeuronGene {
     unsigned char type, active;
 };
 struct NeuronState {
-    float voltage_mv, adaptation_pa, inh_ns, recent_depol_mv;
+    float voltage_mv, adaptation_pa, inh_ns, recent_depol_mv, log_ampa_scale;
     float dendrite_exc_ns[DENDRITES];
+    int total_spikes;
     unsigned char spike;
 };
 struct SynapseGene {
@@ -78,6 +79,21 @@ NS_HD inline float soma_excitation(const NeuronGene &g, const NeuronState &s) {
     return total;
 }
 
+// Empirical 48-hour AMPA quantal-amplitude response in cultured pyramidal
+// cells (Turrigiano et al. 1998). The interpolation between measured conditions
+// is an approximation; no activity response is assigned to inhibitory cells.
+NS_HD inline void homeostatic_advance(const NeuronGene &g, NeuronState &s,
+                                      float elapsed_ms, float observed_hz) {
+    if (g.type != 0) return;
+    constexpr float target_hz = 0.4f; // control culture mean in Figure 2d
+    float ratio = bound(observed_hz / target_hz, 0.0f, 2.65f);
+    float change_per_48h = ratio < 1.0f
+        ? logf(1.92f) * (1.0f - ratio)
+        : logf(0.70f) * ((ratio - 1.0f) / 1.65f);
+    s.log_ampa_scale = bound(s.log_ampa_scale +
+        change_per_48h * (elapsed_ms / 172800000.0f), -3.0f, 3.0f);
+}
+
 // AdEx equations with conductance inputs. Physical units: ms, mV, pA, pF, nS.
 NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
                                  float current_pa, const float *incoming_exc_ns,
@@ -104,6 +120,7 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
         s.voltage_mv = v + h * dv / g.capacitance_pf;
         if (s.voltage_mv >= 0.0f) {
             s.spike = 1;
+            ++s.total_spikes;
             s.voltage_mv = g.reset_mv;
             s.adaptation_pa += g.spike_adapt_pa;
         }
