@@ -125,6 +125,157 @@ static int convergent_spikes(int inputs, int rate_hz, SynapseGene gene,
 
 struct OdorResponse { int baseline_spikes, odor_spikes, onset_spikes, late_spikes; };
 
+struct RandomTimingResponse {
+    double baseline_hz, baseline_sem_hz, odor_hz, odor_sem_hz;
+    double onset_hz, late_hz, baseline_input_hz, odor_input_hz;
+};
+
+static uint32_t next_timing_bitfield(uint32_t &rng) {
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    return rng;
+}
+
+static uint32_t timing_seed(uint32_t identity, uint32_t stream) {
+    uint32_t seed = identity ^ stream;
+    seed ^= seed >> 16;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15;
+    seed *= 0x846ca68bu;
+    seed ^= seed >> 16;
+    return seed ? seed : 1;
+}
+
+// Controlled timing alternatives at the same mean ORN rates: independent
+// Bernoulli spikes or periodic spike trains with independently random phases.
+// Neither is claimed as a fitted distribution of measured ORN intervals.
+static RandomTimingResponse variable_orn_timing(int inputs, int odor_hz,
+                                                 SynapseGene gene,
+                                                 NeuronGene cell,
+                                                 bool random_intervals,
+                                                 int trials = 200) {
+    double baseline_sum = 0, baseline_sq = 0, odor_sum = 0, odor_sq = 0;
+    double onset_sum = 0, late_sum = 0, baseline_input = 0, odor_input = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        auto state = initial_neuron_state(cell);
+        std::vector<SynapseState> axons;
+        std::vector<uint32_t> timing_rng;
+        std::vector<int> baseline_phase, odor_phase;
+        for (int i = 0; i < inputs; ++i) {
+            axons.push_back(initial_synapse_state(gene, trial * inputs + i + 1));
+            uint32_t identity = static_cast<uint32_t>(trial * inputs + i + 1);
+            timing_rng.push_back(timing_seed(identity, 0x9e3779b9u));
+            baseline_phase.push_back(timing_rng.back() % (1000 / 7));
+            odor_phase.push_back((timing_rng.back() >> 8) % (1000 / odor_hz));
+        }
+        int baseline = 0, odor = 0, onset = 0, late = 0;
+        int baseline_orn = 0, odor_orn = 0;
+        for (int t = 0; t < 4500; ++t) {
+            const bool challenge = t >= 4000;
+            const int rate = challenge ? odor_hz : 7;
+            const uint64_t threshold = (uint64_t(rate) << 32) / 1000;
+            float excitation[DENDRITES]{};
+            for (int i = 0; i < inputs; ++i) {
+                uint32_t &rng = timing_rng[i];
+                next_timing_bitfield(rng);
+                const bool input_spike = random_intervals
+                    ? rng < threshold
+                    : ((challenge ? t - 4000 + odor_phase[i]
+                                  : t + baseline_phase[i]) % (1000 / rate) == 0);
+                if (input_spike) {
+                    excitation[i % DENDRITES] += synapse_release(gene, axons[i], t);
+                    if (challenge) ++odor_orn;
+                    else if (t >= 3500) ++baseline_orn;
+                }
+            }
+            neuron_advance(cell, state, 0, excitation, 0);
+            if (state.spike && t >= 3500 && !challenge) ++baseline;
+            if (state.spike && challenge) {
+                ++odor;
+                if (t < 4100) ++onset;
+                if (t >= 4400) ++late;
+            }
+        }
+        baseline_sum += baseline;
+        baseline_sq += baseline * baseline;
+        odor_sum += odor;
+        odor_sq += odor * odor;
+        onset_sum += onset;
+        late_sum += late;
+        baseline_input += baseline_orn;
+        odor_input += odor_orn;
+    }
+    const double baseline_mean = baseline_sum / trials;
+    const double odor_mean = odor_sum / trials;
+    return {2 * baseline_mean,
+            2 * std::sqrt(std::max(0.0, baseline_sq / trials - baseline_mean * baseline_mean) / trials),
+            2 * odor_mean,
+            2 * std::sqrt(std::max(0.0, odor_sq / trials - odor_mean * odor_mean) / trials),
+            10 * onset_sum / trials, 10 * late_sum / trials,
+            2 * baseline_input / (trials * inputs),
+            2 * odor_input / (trials * inputs)};
+}
+
+struct PairResponse { double first_hz, second_hz, count_correlation; };
+
+// Kazama & Wilson (2009) paired-PN control: two PNs receive the same ORN
+// events or independent ORN events. Vesicle release remains independent at
+// the two targets, as in their divergent feedforward interpretation.
+static PairResponse paired_pn_baseline(bool shared_orns, SynapseGene gene,
+                                       NeuronGene cell, int trials = 100) {
+    double count = 0, sum_a = 0, sum_b = 0, sq_a = 0, sq_b = 0, cross = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        auto first = initial_neuron_state(cell);
+        auto second = initial_neuron_state(cell);
+        std::vector<SynapseState> release_a, release_b;
+        std::vector<uint32_t> timing_a, timing_b;
+        for (int i = 0; i < 40; ++i) {
+            release_a.push_back(initial_synapse_state(gene, 1 + trial * 80 + i));
+            release_b.push_back(initial_synapse_state(gene, 41 + trial * 80 + i));
+            uint32_t identity = static_cast<uint32_t>(1 + trial * 80 + i);
+            timing_a.push_back(timing_seed(identity, 0x9e3779b9u));
+            timing_b.push_back(timing_seed(identity, 0x85ebca6bu));
+        }
+        int bin_a = 0, bin_b = 0;
+        for (int t = 0; t < 4000; ++t) {
+            float input_a[DENDRITES]{}, input_b[DENDRITES]{};
+            for (int i = 0; i < 40; ++i) {
+                bool event_a = next_timing_bitfield(timing_a[i]) <
+                    (uint64_t(7) << 32) / 1000;
+                bool event_b = shared_orns ? event_a :
+                    next_timing_bitfield(timing_b[i]) <
+                    (uint64_t(7) << 32) / 1000;
+                if (event_a) input_a[i % DENDRITES] +=
+                    synapse_release(gene, release_a[i], t);
+                if (event_b) input_b[i % DENDRITES] +=
+                    synapse_release(gene, release_b[i], t);
+            }
+            neuron_advance(cell, first, 0, input_a, 0);
+            neuron_advance(cell, second, 0, input_b, 0);
+            if (t >= 3500) {
+                bin_a += first.spike;
+                bin_b += second.spike;
+                if ((t + 1) % 50 == 0) {
+                    ++count;
+                    sum_a += bin_a;
+                    sum_b += bin_b;
+                    sq_a += bin_a * bin_a;
+                    sq_b += bin_b * bin_b;
+                    cross += bin_a * bin_b;
+                    bin_a = bin_b = 0;
+                }
+            }
+        }
+    }
+    double mean_a = sum_a / count, mean_b = sum_b / count;
+    double variance_a = sq_a / count - mean_a * mean_a;
+    double variance_b = sq_b / count - mean_b * mean_b;
+    return {20 * mean_a, 20 * mean_b,
+            (cross / count - mean_a * mean_b) /
+                std::sqrt(variance_a * variance_b)};
+}
+
 static OdorResponse odor_step(int inputs, int odor_hz, SynapseGene gene,
                              NeuronGene cell = cortical_l5_profile()) {
     auto state = initial_neuron_state(cell);
@@ -247,6 +398,7 @@ int main() {
     for (int inputs : {1, 2, 3, 4})
         std::cout << "pn_synchronous_" << inputs << " spikes="
                   << synchronous_spikes(inputs, orn, pn) << '\n';
+    RandomTimingResponse independent_baseline{};
     for (int hz : {7, 10, 20, 50}) {
         auto response = odor_step(40, hz, orn, pn);
         std::cout << "pn_40_orn_" << hz << "Hz baseline_hz="
@@ -254,7 +406,35 @@ int main() {
                   << " odor_hz=" << response.odor_spikes * 2
                   << " onset_hz=" << response.onset_spikes * 10
                   << " late_hz=" << response.late_spikes * 10 << '\n';
+        for (bool irregular : {false, true}) {
+            auto random = variable_orn_timing(40, hz, orn, pn, irregular);
+            if (irregular && hz == 7) independent_baseline = random;
+            std::cout << "pn_40_" << (irregular ? "independent_" : "random_phase_")
+                      << "orn_" << hz
+                      << "Hz baseline_hz=" << random.baseline_hz
+                      << " baseline_sem_hz=" << random.baseline_sem_hz
+                      << " odor_hz=" << random.odor_hz
+                      << " odor_sem_hz=" << random.odor_sem_hz
+                      << " onset_hz=" << random.onset_hz
+                      << " late_hz=" << random.late_hz
+                      << " baseline_orn_hz=" << random.baseline_input_hz
+                      << " odor_orn_hz=" << random.odor_input_hz << '\n';
+        }
     }
+    for (int inputs : {8, 16, 24, 40, 64}) {
+        auto response = variable_orn_timing(inputs, 20, orn, pn, true, 100);
+        std::cout << "independent_orn_count_" << inputs
+                  << " baseline_hz=" << response.baseline_hz
+                  << " odor_20_hz=" << response.odor_hz << '\n';
+    }
+    auto shared = paired_pn_baseline(true, orn, pn);
+    auto separate = paired_pn_baseline(false, orn, pn);
+    std::cout << "pn_pair_shared first_hz=" << shared.first_hz
+              << " second_hz=" << shared.second_hz
+              << " count_50ms_r=" << shared.count_correlation << '\n';
+    std::cout << "pn_pair_separate first_hz=" << separate.first_hz
+              << " second_hz=" << separate.second_hz
+              << " count_50ms_r=" << separate.count_correlation << '\n';
     auto pn_pulse = single_axon(orn, 1000, pn);
     auto basal = train(orn, 20);
     auto strong_train = train(orn, 50);
@@ -267,7 +447,11 @@ int main() {
         strong_train.challenge_last_pa < basal.challenge_last_pa &&
         std::abs(recovery_after_pause(orn, 7500) - 0.85) < 0.06 &&
         weak.odor_spikes > weak.baseline_spikes &&
-        strong.onset_spikes > strong.late_spikes;
+        strong.onset_spikes > strong.late_spikes &&
+        independent_baseline.baseline_hz >= 1.0 &&
+        independent_baseline.baseline_hz <= 5.0 &&
+        shared.count_correlation > 0.3 &&
+        separate.count_correlation < 0.15;
     if (!reproduced) {
         std::cerr << "ORN-to-PN relay protocol regression\n";
         return EXIT_FAILURE;
