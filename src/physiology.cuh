@@ -26,7 +26,7 @@ struct NeuronGene {
     unsigned char type, active;
 };
 struct NeuronState {
-    float voltage_mv, adaptation_pa, inh_ns;
+    float voltage_mv, adaptation_pa, inh_ns, recent_depol_mv;
     float dendrite_exc_ns[DENDRITES];
     unsigned char spike;
 };
@@ -82,6 +82,10 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
                                  float incoming_inh_ns) {
     for (int branch = 0; branch < DENDRITES; ++branch)
         s.dendrite_exc_ns[branch] += incoming_exc_ns[branch];
+    // Sustained depolarization immediately preceding a spike, as measured in
+    // the cooperativity protocol of Sjostrom et al. (2001).
+    float subthreshold = fmaxf(0.0f, fminf(s.voltage_mv, -50.0f) - g.rest_mv);
+    s.recent_depol_mv += 0.1f * (subthreshold - s.recent_depol_mv);
     s.inh_ns += incoming_inh_ns;
     s.spike = 0;
     constexpr int substeps = 4;
@@ -130,25 +134,28 @@ NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int ti
     return s.weight_ns * fraction;
 }
 
-// Pair-timing rule restricted to excitatory -> excitatory synapses. Time
-// constants and target direction follow Bi and Poo (1998); amplitudes are
-// calibrated to their 60-pair ±10 ms protocol, not general cellular laws.
+// Plasticity profile 1: cultured hippocampal pairs in Bi and Poo (1998).
+// Profile 2: cortical L5 pairs in Sjostrom et al. (2001), which require
+// preceding depolarization for LTP. Both depend on NMDA receptors.
 NS_HD inline void synapse_plasticity_step(const SynapseGene &g, SynapseState &s,
                                          bool arrived, bool postsynaptic_spike,
-                                         bool excitatory_pair) {
-    if (!g.plasticity || !excitatory_pair) return;
+                                         bool excitatory_pair,
+                                         float preceding_depol_mv = 0,
+                                         bool nmda_available = true) {
+    if (!g.plasticity || !excitatory_pair || !nmda_available) return;
     s.pre_trace *= expf(-DT_MS / LTP_TRACE_MS);
     s.post_trace *= expf(-DT_MS / LTD_TRACE_MS);
     s.pre_age_ms += DT_MS;
     s.post_age_ms += DT_MS;
     if (arrived) {
-        if (s.post_age_ms <= 20.0f)
+        if (s.post_age_ms <= (g.plasticity == 2 ? 50.0f : 20.0f))
             s.weight_ns *= 1.0f - 0.004f * s.post_trace;
         s.pre_trace += 1.0f;
         s.pre_age_ms = 0;
     }
     if (postsynaptic_spike) {
-        if (s.pre_age_ms <= 20.0f)
+        if (s.pre_age_ms <= 20.0f &&
+            (g.plasticity == 1 || preceding_depol_mv >= 2.3f))
             s.weight_ns += 0.016f * s.pre_trace * (2.0f * g.initial_weight_ns - s.weight_ns);
         s.post_trace += 1.0f;
         s.post_age_ms = 0;

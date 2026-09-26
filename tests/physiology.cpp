@@ -35,16 +35,49 @@ float dendritic_peak(float each_ns, bool same_branch, bool two_inputs = true) {
     return peak;
 }
 
-float paired_plasticity(int interval_ms, bool excitatory_target) {
+float paired_plasticity(int interval_ms, bool excitatory_target,
+                        unsigned char profile = 1, float depol_mv = 0,
+                        bool nmda_available = true, int pairs = 60) {
     SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 5, 1, 1};
+    gene.plasticity = profile;
     SynapseState state = initial_synapse_state(gene);
-    for (int t = 0; t < 60000; ++t) {
+    for (int t = 0; t < pairs * 1000; ++t) {
         int phase = t % 1000;
         bool arrival = phase == 100;
         bool post = phase == 100 + interval_ms;
-        synapse_plasticity_step(gene, state, arrival, post, excitatory_target);
+        synapse_plasticity_step(gene, state, arrival, post, excitatory_target,
+                                depol_mv, nmda_available);
     }
     return state.weight_ns;
+}
+
+float cortical_train(bool bursts, int &evoked_spikes) {
+    NeuronGene neuron = recorded_profile(0);
+    NeuronState cell = initial_neuron_state(neuron);
+    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 2};
+    SynapseState synapse = initial_synapse_state(gene);
+    evoked_spikes = 0;
+    int eligible_spikes = 0;
+    int duration = bursts ? 15000 : 500000;
+    for (int t = 0; t < duration; ++t) {
+        bool pre = bursts ? (t % 1000 >= 100 && t % 1000 <= 200 &&
+                             (t % 1000 - 100) % 25 == 0)
+                          : t % 10000 == 100;
+        bool post_stim = bursts ? (t % 1000 >= 110 && t % 1000 <= 210 &&
+                                   (t % 1000 - 110) % 25 == 0)
+                                : t % 10000 == 110;
+        float input[DENDRITES]{};
+        if (pre) input[0] = 0.2f;
+        neuron_advance(neuron, cell, (bursts ? 25.0f : 0.0f)
+                       + (post_stim ? 3500.0f : 0.0f), input, 0);
+        if (cell.spike) ++evoked_spikes;
+        if (cell.spike && cell.recent_depol_mv >= 2.3f) ++eligible_spikes;
+        synapse_plasticity_step(gene, synapse, pre, cell.spike, true,
+                                cell.recent_depol_mv);
+    }
+    std::cout << (bursts ? "burst" : "sparse") << " eligible spikes "
+              << eligible_spikes << '/' << evoked_spikes << '\n';
+    return synapse.weight_ns;
 }
 
 int main() {
@@ -151,6 +184,33 @@ int main() {
     std::cout << "60-pair STDP weights: +10 " << plus10 << ", -10 " << minus10
               << ", +50 " << plus50 << ", -50 " << minus50
               << ", inhibitory target " << gaba_target << '\n';
+
+    float cortical_weak = paired_plasticity(10, true, 2, 0, true, 50);
+    float cortical_cooperative = paired_plasticity(10, true, 2, 3, true, 50);
+    float cortical_ltd = paired_plasticity(-10, true, 2, 0, true, 50);
+    float cortical_blocked = paired_plasticity(10, true, 2, 3, false, 50);
+    require(std::abs(cortical_weak - 1) < 1e-5f,
+            "low-rate isolated L5 pair should not potentiate");
+    require(cortical_cooperative > 1.2f,
+            "preceding depolarization should rescue L5 potentiation");
+    require(cortical_ltd < 0.9f,
+            "reverse timing should depress at low rate without depolarization");
+    require(std::abs(cortical_blocked - 1) < 1e-5f,
+            "NMDA blockade should prevent L5 potentiation");
+    std::cout << "Cortical L5 50-pair weights: weak " << cortical_weak
+              << ", cooperative " << cortical_cooperative
+              << ", reverse " << cortical_ltd
+              << ", NMDA blocked " << cortical_blocked << '\n';
+    int burst_spikes = 0, sparse_spikes = 0;
+    float burst_weight = cortical_train(true, burst_spikes);
+    float sparse_weight = cortical_train(false, sparse_spikes);
+    require(burst_spikes == 75 && sparse_spikes == 50,
+            "current pulses should evoke the requested cortical spike protocols");
+    require(burst_weight > sparse_weight + 0.05f,
+            "depolarized 40 Hz bursts should potentiate more than sparse pairs");
+    std::cout << "Cortical train weights: depolarized 40 Hz " << burst_weight
+              << " (" << burst_spikes << " evoked), 0.1 Hz " << sparse_weight
+              << " (" << sparse_spikes << " evoked)\n";
     if (failures) return 1;
     std::cout << "All physiology protocol checks passed\n";
 }

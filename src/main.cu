@@ -102,7 +102,7 @@ __device__ void random_synapse(SynapseGene &g, Device d, int animal,
         g.recovery_ms = 30.0f;
         g.facilitation_ms = 1700.0f;
     }
-    g.plasticity = 1;
+    g.plasticity = 2;
     g.active = 1;
 }
 
@@ -225,7 +225,8 @@ __global__ void synapse_plasticity(Device d) {
     bool excitatory_pair = d.neurons[a * N + g.pre].type == 0 &&
         d.neurons[a * N + g.post].type == 0;
     synapse_plasticity_step(g, s, s.arrived,
-        d.neuron_state[a * N + g.post].spike, excitatory_pair);
+        d.neuron_state[a * N + g.post].spike, excitatory_pair,
+        d.neuron_state[a * N + g.post].recent_depol_mv);
     d.synapse_state[i] = s;
 }
 
@@ -298,7 +299,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             g.initial_weight_ns = clamp(g.initial_weight_ns + (uniform(rng) - 0.5f) * 0.5f, 0.1f, 8);
         } else if (choice == 6) {
             auto &g = d.synapses[child * E + e];
-            g.plasticity ^= 1;
+            g.plasticity = (unsigned char)randint(rng, 3);
             g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
             g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
         } else {
