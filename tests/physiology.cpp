@@ -36,7 +36,7 @@ float dendritic_peak(float each_ns, bool same_branch, bool two_inputs = true) {
 }
 
 float paired_plasticity(int interval_ms, bool excitatory_target) {
-    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 1, 5, 1, 1};
+    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 5, 1, 1};
     SynapseState state = initial_synapse_state(gene);
     for (int t = 0; t < 60000; ++t) {
         int phase = t % 1000;
@@ -106,7 +106,7 @@ int main() {
               << ", intermediate " << medium_same << '/' << medium_separate
               << ", strong same/separate " << strong_same << '/' << strong_separate << '\n';
 
-    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 1, 1, 1, 0};
+    SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 0};
     auto state = initial_synapse_state(gene);
     float first = synapse_release(gene, state, 0);
     float second = synapse_release(gene, state, 50);
@@ -117,6 +117,25 @@ int main() {
     require(recovered > first * 0.95f, "release resources should recover after 2 seconds");
     std::cout << "Paired release: " << first << ", " << second
               << " (ratio " << second / first << "), recovered " << recovered << '\n';
+
+    SynapseGene facilitating{1.0f, 0.1f, 30.0f, 1700.0f, 0, 1, 1, 1, 0};
+    SynapseGene depressing{1.0f, 0.55f, 450.0f, 0, 0, 1, 1, 1, 0};
+    auto facil_state = initial_synapse_state(facilitating);
+    auto depress_state = initial_synapse_state(depressing);
+    float facil_first = 0, facil_sixth = 0, depress_first = 0, depress_sixth = 0;
+    for (int pulse = 0; pulse < 6; ++pulse) {
+        float f = synapse_release(facilitating, facil_state, pulse * 33);
+        float d = synapse_release(depressing, depress_state, pulse * 33);
+        if (pulse == 0) { facil_first = f; depress_first = d; }
+        if (pulse == 5) { facil_sixth = f; depress_sixth = d; }
+    }
+    require(facil_sixth > facil_first * 2.0f,
+            "30 Hz train should facilitate at fitted interneuron target");
+    require(depress_sixth < depress_first * 0.5f,
+            "same 30 Hz train should depress at pyramidal target");
+    std::cout << "30 Hz same-axon sixth/first: interneuron "
+              << facil_sixth / facil_first << ", pyramidal "
+              << depress_sixth / depress_first << '\n';
 
     float plus10 = paired_plasticity(10, true);
     float minus10 = paired_plasticity(-10, true);

@@ -85,7 +85,8 @@ __global__ void init_world(Device d, unsigned long long seed) {
     d.food[c] = uniform(rng) < 0.28f ? 1 : 0;
 }
 
-__device__ void random_synapse(SynapseGene &g, unsigned long long &rng) {
+__device__ void random_synapse(SynapseGene &g, Device d, int animal,
+                               unsigned long long &rng) {
     g.pre = (short)randint(rng, N);
     g.post = (short)(S + randint(rng, N - S));
     g.delay = (unsigned char)(1 + randint(rng, D));
@@ -93,6 +94,14 @@ __device__ void random_synapse(SynapseGene &g, unsigned long long &rng) {
     g.initial_weight_ns = 0.5f + uniform(rng) * 3.5f;
     g.utilization = 0.55f;
     g.recovery_ms = 450.0f;
+    g.facilitation_ms = 0;
+    if (d.neurons[animal * N + g.pre].type == 0 &&
+        d.neurons[animal * N + g.post].type == 1) {
+        // One fitted pyramidal-to-interneuron profile in Markram et al. (1998).
+        g.utilization = 0.1f;
+        g.recovery_ms = 30.0f;
+        g.facilitation_ms = 1700.0f;
+    }
     g.plasticity = 1;
     g.active = 1;
 }
@@ -129,7 +138,7 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
     }
     for (int e = 0; e < E; ++e) {
         SynapseGene g{};
-        random_synapse(g, rng);
+        random_synapse(g, d, a, rng);
         g.active = (e < 120) ? 1 : 0;
         d.synapses[a * E + e] = g;
         d.synapse_state[a * E + e] = initial_synapse_state(g);
@@ -283,18 +292,22 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             d.synapses[child * E + e].active ^= 1;
         } else if (choice == 4) {
             auto &g = d.synapses[child * E + e];
-            random_synapse(g, rng);
+            random_synapse(g, d, child, rng);
         } else if (choice == 5) {
             auto &g = d.synapses[child * E + e];
             g.initial_weight_ns = clamp(g.initial_weight_ns + (uniform(rng) - 0.5f) * 0.5f, 0.1f, 8);
         } else if (choice == 6) {
             auto &g = d.synapses[child * E + e];
             g.plasticity ^= 1;
-            g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.2f, 0.8f);
-            g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 200, 1000);
+            g.utilization = clamp(g.utilization + (uniform(rng) - 0.5f) * 0.1f, 0.02f, 0.8f);
+            g.recovery_ms = clamp(g.recovery_ms + (uniform(rng) - 0.5f) * 50, 20, 1000);
         } else {
             auto &g = d.synapses[child * E + e];
             g.delay = (unsigned char)(1 + randint(rng, D));
+            g.facilitation_ms = g.facilitation_ms == 0
+                ? 500.0f + uniform(rng) * 3500.0f
+                : (uniform(rng) < 0.1f ? 0.0f
+                   : clamp(g.facilitation_ms + (uniform(rng) - 0.5f) * 200, 100, 4000));
             d.neurons[child * N + n].spike_adapt_pa = clamp(
                 d.neurons[child * N + n].spike_adapt_pa + (uniform(rng) - 0.5f) * 5, 0, 150);
         }
@@ -404,7 +417,7 @@ void write_brains(const std::string &prefix, Device d) {
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
     cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa\n";
-    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,plasticity\n";
+    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,plasticity\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
             const auto &g = neurons[a * N + n];
@@ -420,7 +433,7 @@ void write_brains(const std::string &prefix, Device d) {
                 edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
                     << g.pre << ',' << g.post << ',' << (int)g.branch << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
                     << states[a * E + e].weight_ns << ',' << g.utilization << ','
-                    << g.recovery_ms << ',' << (int)g.plasticity << '\n';
+                    << g.recovery_ms << ',' << g.facilitation_ms << ',' << (int)g.plasticity << '\n';
         }
     }
 }

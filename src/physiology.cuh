@@ -31,12 +31,12 @@ struct NeuronState {
     unsigned char spike;
 };
 struct SynapseGene {
-    float initial_weight_ns, utilization, recovery_ms;
+    float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
     short pre, post;
     unsigned char delay, active, plasticity, branch;
 };
 struct SynapseState {
-    float weight_ns, available, pre_trace, post_trace;
+    float weight_ns, available, running_utilization, pre_trace, post_trace;
     float pre_age_ms, post_age_ms;
     int last_arrival_tick;
     unsigned char arrived;
@@ -108,17 +108,23 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
 }
 
 NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g) {
-    return {g.initial_weight_ns, 1.0f, 0, 0, 1000000, 1000000, -1000000, 0};
+    return {g.initial_weight_ns, 1.0f, 0, 0, 0, 1000000, 1000000, -1000000, 0};
 }
 
-// Resource depletion and recovery measured in connected pyramidal pairs by
-// Tsodyks and Markram (1997). Returns an excitatory conductance increment.
+// Resource depletion (Tsodyks and Markram 1997), plus the pulse-driven
+// utilization increase measured in facilitating connections by Markram,
+// Wang and Tsodyks (1998). Returns an excitatory conductance increment.
 NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int tick) {
     if (s.last_arrival_tick > -1000000) {
         float elapsed = (tick - s.last_arrival_tick) * DT_MS;
         s.available = 1.0f - (1.0f - s.available) * expf(-elapsed / g.recovery_ms);
+        if (g.facilitation_ms > 0)
+            s.running_utilization *= expf(-elapsed / g.facilitation_ms);
     }
-    float fraction = g.utilization * s.available;
+    s.running_utilization = g.facilitation_ms > 0
+        ? s.running_utilization + g.utilization * (1.0f - s.running_utilization)
+        : g.utilization;
+    float fraction = s.running_utilization * s.available;
     s.available -= fraction;
     s.last_arrival_tick = tick;
     return s.weight_ns * fraction;
