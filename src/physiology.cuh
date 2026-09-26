@@ -46,7 +46,7 @@ struct SynapseState {
     float eligible_ltp, eligible_ltd, da_age_ms;
     float spine_volume, structural_age_ms;
     float pre_age_ms, post_age_ms;
-    int last_arrival_tick;
+    int64_t last_arrival_tick;
     uint32_t ready_mask, rng_state;
     unsigned char arrived;
 };
@@ -198,7 +198,7 @@ NS_HD inline float spine_growth_window(float age_ms) {
 // Resource depletion (Tsodyks and Markram 1997), plus the pulse-driven
 // utilization increase measured in facilitating connections by Markram,
 // Wang and Tsodyks (1998). Returns an excitatory conductance increment.
-NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int tick) {
+NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int64_t tick) {
     float recovery_probability = 0;
     if (s.last_arrival_tick > -1000000) {
         float elapsed = (tick - s.last_arrival_tick) * DT_MS;

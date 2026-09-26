@@ -16,10 +16,10 @@ ctest --test-dir build --output-on-failure
 For a live view, add `--visualize` and open the local address printed by the program (by default, [http://127.0.0.1:8765/](http://127.0.0.1:8765/)):
 
 ```sh
-./build/neural_selection --steps 2000 --population 512 --seed 1 --visualize --output run.csv
+./build/neural_selection --population 512 --seed 1 --visualize --output run.csv
 ```
 
-The browser view shows the 2D food map and moving, oriented animals, with pulses for births and deaths, live population and event counts, a population chart, and details for a clicked animal. Drag to pan, scroll to zoom, and use the controls to pause, resume, change speed, or end the run. At 1× the program targets 20 world steps per second; 4× targets 80; Max runs at GPU speed. The page updates every two world steps and stays available after the run finishes so you can inspect the final state. Press Ctrl+C in the terminal to close it. Use `--port N` if port 8765 is occupied. The server listens only on `127.0.0.1`.
+Live runs have no step limit unless you set `--steps N`. `--steps 0` also selects an unlimited run without the browser. The browser view shows the 2D food map and moving, oriented animals, with pulses for births and deaths, live population and event counts, a population chart, and details for a clicked animal. Drag to pan, scroll to zoom, and use the controls to pause, resume, change speed, or end the run. At 1× the program targets 20 world steps per second; 4× targets 80; Max runs at GPU speed. The page updates every two world steps. End run writes the final image and brain tables and leaves the page open for inspection; Ctrl+C saves and exits. Use `--port N` if port 8765 is occupied. The server listens only on `127.0.0.1`.
 
 Architecture `86` targets an RTX 3080; change it for another GPU. On this machine, a temporary CUDA 12.9 toolkit under `/tmp/cuda129` was used to build the existing executable because `nvcc` was not installed system-wide. If that toolkit is gone, rebuilding needs another CUDA Toolkit.
 

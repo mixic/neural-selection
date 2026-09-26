@@ -215,7 +215,9 @@ function updateUI(data) {
   const status = data.finished ? 'RUN COMPLETE' : data.paused ? 'PAUSED' : 'LIVE';
   $('status').textContent = status;
   $('status-dot').className = 'status-dot ' + (data.finished ? 'finished' : data.paused ? 'paused' : '');
-  $('step-label').textContent = `STEP ${fmt(data.step)} / ${fmt(data.total)}`;
+  $('step-label').textContent = data.total > 0
+    ? `STEP ${fmt(data.step)} / ${fmt(data.total)}`
+    : `STEP ${fmt(data.step)} · NO LIMIT`;
   $('population').textContent = fmt(data.population);
   for (const [id, field] of [['births','births'], ['deaths','deaths'],
     ['predation','predation'], ['bites','bites'], ['food-cells','food_cells'],

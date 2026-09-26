@@ -54,7 +54,7 @@ struct Device {
     NeuronState *neuron_state;
     SynapseState *synapse_state;
     float *pending_exc, *pending_inh, *senses;
-    int *mod_event_tick;
+    unsigned long long *mod_event_tick;
     unsigned char *spike_history;
     int *neuron_owner, *synapse_owner, *neuron_next, *synapse_next;
     int *neuron_port, *neuron_clone;
@@ -160,7 +160,7 @@ __device__ void initialize_neuron(Device d, int n, int owner, int port,
     for (int branch = 0; branch < DENDRITES; ++branch)
         d.pending_exc[n * DENDRITES + branch] = 0;
     d.pending_inh[n] = 0;
-    for (int k = 0; k < 3; ++k) d.mod_event_tick[n * 3 + k] = -1;
+    for (int k = 0; k < 3; ++k) d.mod_event_tick[n * 3 + k] = 0;
     for (int delay = 0; delay < HISTORY; ++delay)
         d.spike_history[delay * NEURON_CAPACITY + n] = 0;
 }
@@ -339,7 +339,7 @@ __global__ void update_senses(Device d) {
     d.senses[a * S + 15] = clamp(b.taste[3], 0, 1);
 }
 
-__global__ void synapse_delivery(Device d, int tick) {
+__global__ void synapse_delivery(Device d, int64_t tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= SYNAPSE_CAPACITY) return;
     int a = d.synapse_owner[i];
@@ -358,7 +358,8 @@ __global__ void synapse_delivery(Device d, int tick) {
             ? synapse_release(g, state, tick) : state.weight_ns;
         if (source.modulator) {
             if (released > 0)
-                atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1], tick);
+                atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1],
+                          static_cast<unsigned long long>(tick + 1));
         } else if (source.type == 0) {
             float postsynaptic_scale = expf(
                 d.neuron_state[g.post].log_ampa_scale);
@@ -371,7 +372,7 @@ __global__ void synapse_delivery(Device d, int tick) {
     d.synapse_state[i] = state;
 }
 
-__global__ void neuron_step(Device d, int tick) {
+__global__ void neuron_step(Device d, int64_t tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= NEURON_CAPACITY) return;
     int a = d.neuron_owner[i];
@@ -398,7 +399,7 @@ __global__ void neuron_step(Device d, int tick) {
     d.neuron_state[i] = state;
 }
 
-__global__ void synapse_plasticity(Device d, int tick) {
+__global__ void synapse_plasticity(Device d, int64_t tick) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= SYNAPSE_CAPACITY) return;
     int a = d.synapse_owner[i];
@@ -414,16 +415,19 @@ __global__ void synapse_plasticity(Device d, int tick) {
         d.neurons[g.post].type == 0;
     int target = g.post * 3;
     unsigned char mod_event = 0;
-    if (d.mod_event_tick[target] == tick) mod_event |= MOD_NE;
-    if (d.mod_event_tick[target + 1] == tick) mod_event |= MOD_5HT;
-    if (d.mod_event_tick[target + 2] == tick) mod_event |= MOD_DA;
+    if (d.mod_event_tick[target] == static_cast<unsigned long long>(tick + 1))
+        mod_event |= MOD_NE;
+    if (d.mod_event_tick[target + 1] == static_cast<unsigned long long>(tick + 1))
+        mod_event |= MOD_5HT;
+    if (d.mod_event_tick[target + 2] == static_cast<unsigned long long>(tick + 1))
+        mod_event |= MOD_DA;
     synapse_plasticity_step(g, s, s.arrived,
         d.neuron_state[g.post].spike, excitatory_pair,
         d.neuron_state[g.post].recent_depol_mv, true, mod_event);
     d.synapse_state[i] = s;
 }
 
-__global__ void regrow(Device d, int step, unsigned long long seed,
+__global__ void regrow(Device d, int64_t step, unsigned long long seed,
                        float renewal_probability) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= W * H || d.food[c] != 0) return;
@@ -888,14 +892,18 @@ void on_interrupt(int) { interrupted = 1; }
 
 int main(int argc, char **argv) {
     using namespace sim;
-    int steps = 2000, initial = 1024;
+    int64_t steps = 2000;
+    int initial = 1024;
     int live_port = 8765;
-    bool visualize = false;
+    bool visualize = false, steps_specified = false;
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
     std::string output = "run.csv";
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
+            steps = strtoll(argv[++i], nullptr, 10);
+            steps_specified = true;
+        }
         else if (!strcmp(argv[i], "--population") && i + 1 < argc) initial = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--food-renewal") && i + 1 < argc)
@@ -903,19 +911,21 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
         else if (!strcmp(argv[i], "--visualize")) visualize = true;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) live_port = atoi(argv[++i]);
-        else { std::cerr << "Usage: neural_selection [--steps N] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535]\n"; return 2; }
     }
-    if (steps < 1 || initial < 1 || initial > P || !std::isfinite(food_renewal) ||
+    if (visualize && !steps_specified) steps = 0;
+    if (steps < 0 || steps > INT64_MAX / TICKS ||
+        initial < 1 || initial > P || !std::isfinite(food_renewal) ||
         food_renewal < 0 || food_renewal > 1 || live_port < 1 || live_port > 65535) {
         std::cerr << "Invalid steps, population, food renewal, or port\n"; return 2;
     }
+    std::signal(SIGINT, on_interrupt);
     std::unique_ptr<LiveView> live;
     if (visualize) {
         try { live = std::make_unique<LiveView>(live_port); }
         catch (const std::exception &error) {
             std::cerr << error.what() << '\n'; return 1;
         }
-        std::signal(SIGINT, on_interrupt);
         std::cout << "Live world: http://127.0.0.1:" << live_port << '/'
                   << "  (Ctrl+C to close after the run)\n" << std::flush;
     }
@@ -974,7 +984,7 @@ int main(int argc, char **argv) {
     std::vector<int> active_neurons, active_synapses;
     std::vector<int> food, kind;
     std::vector<uint32_t> neuron_used, synapse_used;
-    auto report = [&](int step, bool log) {
+    auto report = [&](int64_t step, bool log) {
         count_brains<<<(P + 127) / 128, 128>>>(d);
         check(cudaDeviceSynchronize(), "simulation step");
         check(cudaGetLastError(), "CUDA kernel");
@@ -1064,8 +1074,8 @@ int main(int argc, char **argv) {
         }
     };
     report(0, true);
-    int last_step = 0;
-    for (int step = 1; step <= steps; ++step) {
+    int64_t last_step = 0;
+    for (int64_t step = 1; steps == 0 || step <= steps; ++step) {
         if (interrupted || (live && live->stop_requested())) break;
         if (live) {
             while (live->paused() && !live->stop_requested() && !interrupted)
@@ -1074,7 +1084,7 @@ int main(int argc, char **argv) {
         }
         auto frame_start = std::chrono::steady_clock::now();
         for (int t = 0; t < TICKS; ++t) {
-            int tick = (step - 1) * TICKS + t;
+            int64_t tick = (step - 1) * TICKS + t;
             synapse_delivery<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
             neuron_step<<<(NEURON_CAPACITY + 255) / 256, 256>>>(d, tick);
             synapse_plasticity<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
@@ -1092,14 +1102,15 @@ int main(int argc, char **argv) {
         index_animals<<<(P + 127) / 128, 128>>>(d);
         update_senses<<<(P + 127) / 128, 128>>>(d);
         last_step = step;
-        bool log = step % 100 == 0 || step == steps;
+        bool log = step % 100 == 0 || (steps > 0 && step == steps);
         if (log || (live && step % 2 == 0)) report(step, log);
         if (live && live->speed() > 0) {
             int ms = live->speed() == 1 ? 50 : 12;
             std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(ms));
         }
     }
-    if (live && last_step > 0 && last_step < steps && last_step % 100 != 0)
+    if (last_step > 0 && (steps == 0 || last_step < steps) &&
+        last_step % 100 != 0)
         report(last_step, true);
     write_world(output + ".png", d);
     write_brains(output, d);
