@@ -134,7 +134,9 @@ NS_HD inline void homeostatic_advance(const NeuronGene &g, NeuronState &s,
 // AdEx equations with conductance inputs. Physical units: ms, mV, pA, pF, nS.
 NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
                                  float current_pa, const float *incoming_exc_ns,
-                                 float incoming_inh_ns) {
+                                 float incoming_inh_ns,
+                                 float clamp_leak_ns = 0.0f,
+                                 float clamp_reversal_mv = -68.0f) {
     for (int branch = 0; branch < DENDRITES; ++branch)
         s.dendrite_exc_ns[branch] += incoming_exc_ns[branch];
     // Sustained depolarization immediately preceding a spike, as measured in
@@ -150,7 +152,8 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
             excitation += s.dendrite_exc_ns[branch];
         float external_pa = current_pa +
             excitation * (EXC_REVERSAL_MV - s.voltage_mv) +
-            s.inh_ns * (INH_REVERSAL_MV - s.voltage_mv);
+            s.inh_ns * (INH_REVERSAL_MV - s.voltage_mv) -
+            clamp_leak_ns * (s.voltage_mv - clamp_reversal_mv);
         lp_advance(s.lp, external_pa / 1000.0f, g.lp_scale);
         s.voltage_mv = s.lp.x[15] - 9.342518882f;
         s.spike = old_axon < 0 && s.lp.x[0] >= 0;
@@ -170,7 +173,8 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
             + g.leak_ns * g.slope_mv * expf(exponent)
             + soma_excitation(g, s) * (EXC_REVERSAL_MV - v)
             + s.inh_ns * (INH_REVERSAL_MV - v)
-            + current_pa + s.afterdepol_pa - s.adaptation_pa;
+            + current_pa + s.afterdepol_pa - s.adaptation_pa
+            - clamp_leak_ns * (v - clamp_reversal_mv);
         s.voltage_mv = v + h * dv / g.capacitance_pf;
         if (s.voltage_mv >= 0.0f) {
             s.spike = 1;
