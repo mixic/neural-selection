@@ -24,6 +24,8 @@ constexpr int H = 128;
 constexpr int D = 8;
 constexpr int HISTORY = D + 1;
 constexpr int TICKS = 16;
+constexpr float BODY_UPKEEP = 0.003f;
+constexpr float NEURON_UPKEEP = 0.0002f;
 constexpr float BITE_DAMAGE = 2.0f;
 constexpr float BITE_ENERGY_COST = 0.02f;
 constexpr float MEAT_ENERGY_FRACTION = 0.45f;
@@ -305,7 +307,11 @@ __global__ void body_step(Device d) {
     b.heading += (right - left) * 1.2f;
     b.x = clamp(b.x + cosf(b.heading) * thrust * 1.5f, 0, W - 0.001f);
     b.y = clamp(b.y + sinf(b.heading) * thrust * 1.5f, 0, H - 0.001f);
-    b.energy -= 0.012f + thrust * 0.02f +
+    int active_neurons = 0;
+    for (int n = 0; n < N; ++n)
+        active_neurons += d.neurons[a * N + n].active;
+    b.energy -= BODY_UPKEEP + active_neurons * NEURON_UPKEEP +
+                thrust * 0.02f +
                 (d.bite_intent[a] ? BITE_ENERGY_COST : 0.0f);
     b.fullness = fmaxf(0, b.fullness - 0.05f);
     b.pain *= 0.8f;

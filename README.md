@@ -21,7 +21,9 @@ Each world step advances the neural simulation by 16 one-millisecond ticks. The 
 
 There are no fixed predator and prey species. Every animal can detect other animals in three directions and has a separate neural bite output. A bite costs energy, injures a co-located animal, and gives that animal a pain signal. A lethal bite transfers 45% of the prey's remaining energy to the attacker and activates a meat-taste signal. Predation therefore transfers existing energy rather than adding a reward signal. Whether animals hunt or avoid others depends on their evolving circuits.
 
-Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the current bite and food parameters, two runs starting at 512 animals had 429 and 446 animals at step 10,000. The second run continued to step 30,000, reaching generation 80; its population stayed between 348 and 508 after step 5,000. All these counts are below the 2,048-slot safety ceiling. This is an empirical calibration, not a guaranteed equilibrium for every seed or evolved population.
+Each active neuron costs 0.0002 energy per world step, in addition to a 0.003 body upkeep cost and the costs of movement and biting. These are ecological calibration parameters, not fitted neuronal metabolism. At roughly 45 active neurons, total idle upkeep is about the previous 0.012 energy per step, while larger brains now need to earn their extra energy use.
+
+Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the current bite and per-neuron upkeep parameters, a 10,000-step run starting at 512 animals ended with 339 animals and never reached the 2,048-slot safety ceiling. This is an empirical calibration, not a guaranteed equilibrium for every seed or evolved population.
 
 ## Neural model
 
