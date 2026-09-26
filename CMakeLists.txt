@@ -11,5 +11,8 @@ target_link_libraries(neural_selection PRIVATE PNG::PNG)
 
 add_executable(physiology_protocols tests/physiology.cpp)
 target_include_directories(physiology_protocols PRIVATE src)
+add_executable(neuromodulation_protocols tests/neuromodulation.cpp)
+target_include_directories(neuromodulation_protocols PRIVATE src)
 enable_testing()
 add_test(NAME physiology_protocols COMMAND physiology_protocols)
+add_test(NAME neuromodulation_protocols COMMAND neuromodulation_protocols)

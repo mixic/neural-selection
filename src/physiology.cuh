@@ -18,6 +18,9 @@ constexpr float EXC_REVERSAL_MV = 0.0f;
 constexpr float INH_REVERSAL_MV = -75.0f;
 constexpr float LTP_TRACE_MS = 17.0f;
 constexpr float LTD_TRACE_MS = 34.0f;
+constexpr unsigned char MOD_NE = 1;
+constexpr unsigned char MOD_5HT = 2;
+constexpr unsigned char MOD_DA = 4;
 
 // Parameter sets fitted to step-current recordings in Naud et al. (2008), Table 1.
 // 0: regular-spiking pyramidal cell; 1: continuously non-adapting interneuron.
@@ -25,7 +28,7 @@ struct NeuronGene {
     float capacitance_pf, leak_ns, rest_mv, threshold_mv, slope_mv;
     float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv, bias_pa;
     float afterdepol_spike_pa, afterdepol_tau_ms;
-    unsigned char type, active;
+    unsigned char type, active, modulator;
 };
 struct NeuronState {
     float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
@@ -36,10 +39,11 @@ struct NeuronState {
 struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
     short pre, post;
-    unsigned char delay, active, plasticity, branch, release_sites;
+    unsigned char delay, active, plasticity, branch, release_sites, mod_receptors;
 };
 struct SynapseState {
     float weight_ns, running_utilization, pre_trace, post_trace;
+    float eligible_ltp, eligible_ltd;
     float pre_age_ms, post_age_ms;
     int last_arrival_tick;
     uint32_t ready_mask, rng_state;
@@ -51,8 +55,8 @@ NS_HD inline float bound(float x, float low, float high) {
 }
 
 NS_HD inline NeuronGene recorded_profile(unsigned char type) {
-    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 0, 1, 1};
-    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 0, 1};
+    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 0, 1, 1, 0};
+    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 0, 1, 0};
 }
 
 // Visual-cortex L5 protocol profile. The Naud step-current fit above remains
@@ -169,7 +173,7 @@ NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
     x ^= x >> 15; x *= 0x846ca68bu;
     x ^= x >> 16;
     if (!x) x = 1;
-    return {g.initial_weight_ns, 0, 0, 0, 1000000, 1000000,
+    return {g.initial_weight_ns, 0, 0, 0, 0, 0, 1000000, 1000000,
             -1000000, (1u << site_count(g)) - 1u, x, 0};
 }
 
@@ -208,8 +212,36 @@ NS_HD inline void synapse_plasticity_step(const SynapseGene &g, SynapseState &s,
                                          bool arrived, bool postsynaptic_spike,
                                          bool excitatory_pair,
                                          float preceding_depol_mv = 0,
-                                         bool nmda_available = true) {
+                                         bool nmda_available = true,
+                                         unsigned char mod_event = 0) {
     if (!g.plasticity || !excitatory_pair || !nmda_available) return;
+    if (g.plasticity == 3) {
+        // He et al. (2015): activity leaves distinct silent LTP/LTD traces.
+        // In this visual-cortex profile, local beta2-adrenergic and 5-HT2C
+        // receptor activation converts only the matching trace.
+        s.eligible_ltp *= expf(-DT_MS / 7200.0f);
+        s.eligible_ltd *= expf(-DT_MS / 3600.0f);
+        s.pre_age_ms += DT_MS;
+        s.post_age_ms += DT_MS;
+        if (arrived) {
+            if (s.post_age_ms <= 15.0f) s.eligible_ltd += 1.0f;
+            s.pre_age_ms = 0;
+        }
+        if (postsynaptic_spike) {
+            if (s.pre_age_ms <= 15.0f) s.eligible_ltp += 1.0f;
+            s.post_age_ms = 0;
+        }
+        if ((mod_event & MOD_NE) && (g.mod_receptors & MOD_NE)) {
+            s.weight_ns += 0.0048f * s.eligible_ltp * g.initial_weight_ns;
+            s.eligible_ltp = 0;
+        }
+        if ((mod_event & MOD_5HT) && (g.mod_receptors & MOD_5HT)) {
+            s.weight_ns -= 0.0075f * s.eligible_ltd * g.initial_weight_ns;
+            s.eligible_ltd = 0;
+        }
+        s.weight_ns = bound(s.weight_ns, 0.0f, 2.0f * g.initial_weight_ns);
+        return;
+    }
     s.pre_trace *= expf(-DT_MS / LTP_TRACE_MS);
     s.post_trace *= expf(-DT_MS / LTD_TRACE_MS);
     s.pre_age_ms += DT_MS;
