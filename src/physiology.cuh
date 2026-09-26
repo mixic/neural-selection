@@ -11,6 +11,7 @@
 namespace sim {
 constexpr float DT_MS = 1.0f;
 constexpr float EXC_DECAY_MS = 3.0f;
+constexpr int DENDRITES = 4;
 constexpr float INH_DECAY_MS = 10.0f;
 constexpr float EXC_REVERSAL_MV = 0.0f;
 constexpr float INH_REVERSAL_MV = -75.0f;
@@ -25,13 +26,14 @@ struct NeuronGene {
     unsigned char type, active;
 };
 struct NeuronState {
-    float voltage_mv, adaptation_pa, exc_ns, inh_ns;
+    float voltage_mv, adaptation_pa, inh_ns;
+    float dendrite_exc_ns[DENDRITES];
     unsigned char spike;
 };
 struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms;
     short pre, post;
-    unsigned char delay, active, plasticity;
+    unsigned char delay, active, plasticity, branch;
 };
 struct SynapseState {
     float weight_ns, available, pre_trace, post_trace;
@@ -50,14 +52,36 @@ NS_HD inline NeuronGene recorded_profile(unsigned char type) {
 }
 
 NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
-    return {g.rest_mv, 0, 0, 0, 0};
+    NeuronState state{};
+    state.voltage_mv = g.rest_mv;
+    return state;
+}
+
+// Phenomenological thin-branch input/output curve: linear for weak inputs,
+// regenerative at intermediate strengths, then saturated. Polsky et al.
+// (2004) measured this shape for nearby inputs on one pyramidal dendrite.
+// The nS threshold and gain here are fitted to the qualitative protocol,
+// not measured molecular channel parameters.
+NS_HD inline float dendritic_transfer(float conductance_ns) {
+    float regenerative = 5.0f / (1.0f + expf(-(conductance_ns - 4.0f) / 0.4f));
+    float offset = 5.0f / (1.0f + expf(10.0f));
+    return fminf(11.0f, conductance_ns + regenerative - offset);
+}
+
+NS_HD inline float soma_excitation(const NeuronGene &g, const NeuronState &s) {
+    float total = 0;
+    for (int branch = 0; branch < DENDRITES; ++branch)
+        total += g.type == 0 ? dendritic_transfer(s.dendrite_exc_ns[branch])
+                             : s.dendrite_exc_ns[branch];
+    return total;
 }
 
 // AdEx equations with conductance inputs. Physical units: ms, mV, pA, pF, nS.
 NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
-                                 float current_pa, float incoming_exc_ns,
+                                 float current_pa, const float *incoming_exc_ns,
                                  float incoming_inh_ns) {
-    s.exc_ns += incoming_exc_ns;
+    for (int branch = 0; branch < DENDRITES; ++branch)
+        s.dendrite_exc_ns[branch] += incoming_exc_ns[branch];
     s.inh_ns += incoming_inh_ns;
     s.spike = 0;
     constexpr int substeps = 4;
@@ -68,7 +92,7 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
         float exponent = bound((v - g.threshold_mv) / g.slope_mv, -20.0f, 10.0f);
         float dv = g.leak_ns * (g.rest_mv - v)
             + g.leak_ns * g.slope_mv * expf(exponent)
-            + s.exc_ns * (EXC_REVERSAL_MV - v)
+            + soma_excitation(g, s) * (EXC_REVERSAL_MV - v)
             + s.inh_ns * (INH_REVERSAL_MV - v)
             + current_pa - s.adaptation_pa;
         s.voltage_mv = v + h * dv / g.capacitance_pf;
@@ -77,7 +101,8 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
             s.voltage_mv = g.reset_mv;
             s.adaptation_pa += g.spike_adapt_pa;
         }
-        s.exc_ns *= expf(-h / EXC_DECAY_MS);
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            s.dendrite_exc_ns[branch] *= expf(-h / EXC_DECAY_MS);
         s.inh_ns *= expf(-h / INH_DECAY_MS);
     }
 }

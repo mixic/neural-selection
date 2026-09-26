@@ -89,6 +89,7 @@ __device__ void random_synapse(SynapseGene &g, unsigned long long &rng) {
     g.pre = (short)randint(rng, N);
     g.post = (short)(S + randint(rng, N - S));
     g.delay = (unsigned char)(1 + randint(rng, D));
+    g.branch = (unsigned char)randint(rng, DENDRITES);
     g.initial_weight_ns = 0.5f + uniform(rng) * 3.5f;
     g.utilization = 0.55f;
     g.recovery_ms = 450.0f;
@@ -120,7 +121,8 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
         g.active = (n < S + M || uniform(rng) < 0.5f) ? 1 : 0;
         d.neurons[a * N + n] = g;
         d.neuron_state[a * N + n] = initial_neuron_state(g);
-        d.pending_exc[a * N + n] = 0;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            d.pending_exc[(a * N + n) * DENDRITES + branch] = 0;
         d.pending_inh[a * N + n] = 0;
         for (int delay = 0; delay < HISTORY; ++delay)
             d.spike_history[(delay * P + a) * N + n] = 0;
@@ -171,8 +173,10 @@ __global__ void synapse_delivery(Device d, int tick) {
     if (state.arrived) {
         float released = d.neurons[a * N + g.pre].type == 0
             ? synapse_release(g, state, tick) : state.weight_ns;
-        float *target = d.neurons[a * N + g.pre].type == 0 ? d.pending_exc : d.pending_inh;
-        atomicAdd(&target[a * N + g.post], released);
+        if (d.neurons[a * N + g.pre].type == 0)
+            atomicAdd(&d.pending_exc[(a * N + g.post) * DENDRITES + g.branch], released);
+        else
+            atomicAdd(&d.pending_inh[a * N + g.post], released);
     }
     d.synapse_state[i] = state;
 }
@@ -185,8 +189,14 @@ __global__ void neuron_step(Device d, int tick) {
     NeuronGene g = d.neurons[i];
     if (!g.active) return;
     NeuronState state = d.neuron_state[i];
-    float exc = d.pending_exc[i], inh = d.pending_inh[i];
-    d.pending_exc[i] = d.pending_inh[i] = 0;
+    float exc[DENDRITES];
+    for (int branch = 0; branch < DENDRITES; ++branch) {
+        int slot = i * DENDRITES + branch;
+        exc[branch] = d.pending_exc[slot];
+        d.pending_exc[slot] = 0;
+    }
+    float inh = d.pending_inh[i];
+    d.pending_inh[i] = 0;
     float sensory = n < S ? d.senses[a * S + n] * 230.0f : 0.0f;
     neuron_advance(g, state, g.bias_pa + sensory, exc, inh);
     if (state.spike && n >= S && n < S + M)
@@ -317,7 +327,9 @@ __global__ void reproduce(Device d) {
     for (int n = 0; n < N; ++n) {
         d.neurons[child * N + n] = d.neurons[a * N + n];
         d.neuron_state[child * N + n] = initial_neuron_state(d.neurons[child * N + n]);
-        d.pending_exc[child * N + n] = d.pending_inh[child * N + n] = 0;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            d.pending_exc[(child * N + n) * DENDRITES + branch] = 0;
+        d.pending_inh[child * N + n] = 0;
         for (int delay = 0; delay < HISTORY; ++delay)
             d.spike_history[(delay * P + child) * N + n] = 0;
     }
@@ -392,7 +404,7 @@ void write_brains(const std::string &prefix, Device d) {
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
     cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa\n";
-    edges << "animal_id,generation,synapse,pre,post,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,plasticity\n";
+    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,plasticity\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
             const auto &g = neurons[a * N + n];
@@ -406,7 +418,7 @@ void write_brains(const std::string &prefix, Device d) {
             const auto &g = synapses[a * E + e];
             if (g.active && neurons[a * N + g.pre].active && neurons[a * N + g.post].active)
                 edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
-                    << g.pre << ',' << g.post << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
+                    << g.pre << ',' << g.post << ',' << (int)g.branch << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
                     << states[a * E + e].weight_ns << ',' << g.utilization << ','
                     << g.recovery_ms << ',' << (int)g.plasticity << '\n';
         }
@@ -434,7 +446,7 @@ int main(int argc, char **argv) {
     Device d{};
     allocate(d.animals, P); allocate(d.neurons, P * N); allocate(d.synapses, P * E);
     allocate(d.neuron_state, P * N); allocate(d.synapse_state, P * E);
-    allocate(d.pending_exc, P * N); allocate(d.pending_inh, P * N);
+    allocate(d.pending_exc, P * N * DENDRITES); allocate(d.pending_inh, P * N);
     allocate(d.spike_history, HISTORY * P * N); allocate(d.senses, P * S);
     allocate(d.motors, P * M);
     allocate(d.food, W * H); allocate(d.kind, W * H);

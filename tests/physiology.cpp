@@ -9,12 +9,30 @@ using namespace sim;
 std::vector<int> current_step(const NeuronGene &g, float current_pa) {
     NeuronState state = initial_neuron_state(g);
     std::vector<int> spikes;
+    const float no_input[DENDRITES]{};
     for (int t = 0; t < 2000; ++t) {
-        neuron_advance(g, state, current_pa, 0, 0);
+        neuron_advance(g, state, current_pa, no_input, 0);
         if (state.spike) spikes.push_back(t);
         if (!std::isfinite(state.voltage_mv)) return {};
     }
     return spikes;
+}
+
+float dendritic_peak(float each_ns, bool same_branch, bool two_inputs = true) {
+    NeuronGene g = recorded_profile(0);
+    g.threshold_mv = 100.0f; // voltage-clamp-style subthreshold readout
+    NeuronState state = initial_neuron_state(g);
+    float peak = 0;
+    for (int t = 0; t < 30; ++t) {
+        float input[DENDRITES]{};
+        if (t == 0) {
+            input[0] = each_ns;
+            if (two_inputs) input[same_branch ? 0 : 1] += each_ns;
+        }
+        neuron_advance(g, state, 0, input, 0);
+        peak = std::max(peak, state.voltage_mv - g.rest_mv);
+    }
+    return peak;
 }
 
 float paired_plasticity(int interval_ms, bool excitatory_target) {
@@ -59,13 +77,34 @@ int main() {
               << ", cNA " << cna_fit.size() << '\n';
 
     auto inhibited = initial_neuron_state(recorded_profile(1));
-    neuron_advance(recorded_profile(1), inhibited, 0, 0, 4);
+    const float no_input[DENDRITES]{};
+    neuron_advance(recorded_profile(1), inhibited, 0, no_input, 4);
     require(inhibited.voltage_mv < recorded_profile(1).rest_mv,
             "recorded inhibitory reversal should hyperpolarize a resting neuron");
     for (int t = 1; t < 10; ++t)
-        neuron_advance(recorded_profile(1), inhibited, 0, 0, 0);
+        neuron_advance(recorded_profile(1), inhibited, 0, no_input, 0);
     require(inhibited.inh_ns > 1.0f && inhibited.inh_ns < 2.0f,
             "fast inhibitory conductance should decay on a roughly 10 ms scale");
+
+    float weak_separate = dendritic_peak(0.5f, false);
+    float weak_same = dendritic_peak(0.5f, true);
+    float medium_single = dendritic_peak(2.5f, false, false);
+    float medium_same = dendritic_peak(2.5f, true);
+    float medium_separate = dendritic_peak(2.5f, false);
+    float strong_separate = dendritic_peak(8.0f, false);
+    float strong_same = dendritic_peak(8.0f, true);
+    require(weak_same > weak_separate * 0.9f && weak_same < weak_separate * 1.1f,
+            "weak same-branch inputs should sum approximately linearly");
+    require(medium_same > medium_separate * 1.2f,
+            "intermediate same-branch inputs should sum superlinearly");
+    require(medium_separate > 2.0f * medium_single * 0.85f &&
+            medium_separate < 2.0f * medium_single * 1.1f,
+            "intermediate between-branch inputs should sum approximately linearly");
+    require(strong_same < strong_separate * 0.9f,
+            "strong same-branch inputs should saturate");
+    std::cout << "Dendritic peak mV: weak same/separate " << weak_same << '/' << weak_separate
+              << ", intermediate " << medium_same << '/' << medium_separate
+              << ", strong same/separate " << strong_same << '/' << strong_separate << '\n';
 
     SynapseGene gene{1.0f, 0.55f, 450.0f, 0, 1, 1, 1, 0};
     auto state = initial_synapse_state(gene);
