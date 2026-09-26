@@ -234,6 +234,10 @@ function updateUI(data) {
     const alignment = item[3] ? item[2] / item[3] : 0;
     return `<div class="choice-row"><div><span>${foodNames[i]}</span><strong>${opportunities ? (share * 100).toFixed(1) + '%' : '—'}</strong></div><div class="choice-track"><i style="width:${(share * 100).toFixed(1)}%"></i></div><small>${fmt(opportunities)} encounters · approach ${alignment >= 0 ? '+' : ''}${alignment.toFixed(2)}</small></div>`;
   }).join('');
+  const empty = data.empty_choice || [0, 0];
+  $('empty-choice').textContent = empty[1]
+    ? `Eat attempts on empty cells: ${(empty[0] / empty[1] * 100).toFixed(1)}%`
+    : 'Eat attempts on empty cells: —';
   updateInspector();
 }
 

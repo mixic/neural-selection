@@ -47,6 +47,7 @@ constexpr float PI = 3.14159265358979323846f;
 struct Behavior {
     int opportunities[3][2][3];
     int accepted[3][2][3];
+    int empty_steps[3][2], empty_eat[3][2];
     float approach_progress[3][3];
     float approach_travel[3][3];
     int first_b_age, offspring, death_cause;
@@ -516,6 +517,9 @@ __global__ void body_step(Device d) {
     if (food_offered) {
         int kind = d.kind[food_cell];
         ++b.behavior.opportunities[age_bin][hungry ? 0 : 1][kind];
+    } else {
+        ++b.behavior.empty_steps[age_bin][hungry ? 0 : 1];
+        b.behavior.empty_eat[age_bin][hungry ? 0 : 1] += eat;
     }
     if (eat) {
         if (harvest(&d.food[food_cell])) {
@@ -982,18 +986,22 @@ void write_brains(const std::string &prefix, Device d) {
 
 struct BehaviorTotals {
     uint64_t opportunities[3][2][3]{}, accepted[3][2][3]{};
+    uint64_t empty_steps[3][2]{}, empty_eat[3][2]{};
     double approach_progress[3][3]{}, approach_travel[3][3]{};
 };
 
 void add_behavior(BehaviorTotals &totals, const Behavior &b) {
     for (int age = 0; age < 3; ++age) {
-        for (int hunger = 0; hunger < 2; ++hunger)
+        for (int hunger = 0; hunger < 2; ++hunger) {
             for (int food = 0; food < 3; ++food) {
                 totals.opportunities[age][hunger][food] +=
                     b.opportunities[age][hunger][food];
                 totals.accepted[age][hunger][food] +=
                     b.accepted[age][hunger][food];
             }
+            totals.empty_steps[age][hunger] += b.empty_steps[age][hunger];
+            totals.empty_eat[age][hunger] += b.empty_eat[age][hunger];
+        }
         for (int food = 0; food < 3; ++food) {
             totals.approach_progress[age][food] +=
                 b.approach_progress[age][food];
@@ -1007,12 +1015,16 @@ void write_behavior_header(std::ostream &out) {
     constexpr const char *ages[] = {"early", "middle", "late"};
     constexpr const char *foods[] = {"a", "b", "c"};
     for (int age = 0; age < 3; ++age) {
-        for (int hunger = 0; hunger < 2; ++hunger)
+        for (int hunger = 0; hunger < 2; ++hunger) {
             for (int food = 0; food < 3; ++food)
                 out << ',' << ages[age] << (hunger == 0 ? "_hungry" : "_sated")
                     << "_op_" << foods[food] << ',' << ages[age]
                     << (hunger == 0 ? "_hungry" : "_sated")
                     << "_eat_" << foods[food];
+            out << ',' << ages[age] << (hunger == 0 ? "_hungry" : "_sated")
+                << "_empty_steps," << ages[age]
+                << (hunger == 0 ? "_hungry" : "_sated") << "_empty_eat";
+        }
         for (int food = 0; food < 3; ++food)
             out << ',' << ages[age] << "_approach_" << foods[food]
                 << ',' << ages[age] << "_travel_" << foods[food];
@@ -1021,10 +1033,13 @@ void write_behavior_header(std::ostream &out) {
 
 template <typename T> void write_behavior_values(std::ostream &out, const T &b) {
     for (int age = 0; age < 3; ++age) {
-        for (int hunger = 0; hunger < 2; ++hunger)
+        for (int hunger = 0; hunger < 2; ++hunger) {
             for (int food = 0; food < 3; ++food)
                 out << ',' << b.opportunities[age][hunger][food]
                     << ',' << b.accepted[age][hunger][food];
+            out << ',' << b.empty_steps[age][hunger]
+                << ',' << b.empty_eat[age][hunger];
+        }
         for (int food = 0; food < 3; ++food)
             out << ',' << b.approach_progress[age][food]
                 << ',' << b.approach_travel[age][food];
@@ -1279,7 +1294,17 @@ int main(int argc, char **argv) {
                 json << '[' << accepted << ',' << opportunities << ','
                      << progress << ',' << travel << ']';
             }
-            json << "],\"animals\":[";
+            uint64_t empty_steps = 0, empty_eat = 0;
+            if (!behavior_history.empty()) {
+                const BehaviorTotals &now = behavior_history.back().second;
+                const BehaviorTotals &then = behavior_history.front().second;
+                for (int age = 0; age < 3; ++age) {
+                    empty_steps += now.empty_steps[age][0] - then.empty_steps[age][0];
+                    empty_eat += now.empty_eat[age][0] - then.empty_eat[age][0];
+                }
+            }
+            json << "],\"empty_choice\":[" << empty_eat << ',' << empty_steps
+                 << "],\"animals\":[";
             bool first = true;
             for (int a = 0; a < P; ++a) if (bodies[a].alive == 1) {
                 const Animal &b = bodies[a];

@@ -8,4 +8,5 @@
 .choice-row:nth-child(2) .choice-track i{background:var(--orange)}
 .choice-row:nth-child(3) .choice-track i{background:var(--blue)}
 .choice-row small{color:var(--muted);font-size:10px}
+.empty-choice{font-family:'Space Grotesk',sans-serif;font-size:11px;color:var(--mint);margin-top:20px}
 .choice-note{border-top:1px solid var(--line);margin-top:20px;padding-top:14px}

@@ -40,6 +40,13 @@ def describe_window(label, start, end):
             parts.append(f"{food.upper()} {accepted:,.0f}/{opportunities:,.0f} "
                          f"({rate(accepted, opportunities):.1%})")
         print(f"  {hunger} food encounters accepted: " + ", ".join(parts))
+        empty_steps = sum(delta(start, end, f"{age}_{hunger}_empty_steps")
+                          for age in AGES)
+        empty_eat = sum(delta(start, end, f"{age}_{hunger}_empty_eat")
+                        for age in AGES)
+        print(f"  {hunger} eat attempts on empty cells: "
+              f"{empty_eat:,.0f}/{empty_steps:,.0f} "
+              f"({rate(empty_eat, empty_steps):.1%})")
     approaches = []
     for food in FOODS:
         progress = sum(delta(start, end, f"{age}_approach_{food}") for age in AGES)
@@ -54,26 +61,31 @@ def lifetime_comparison(lives, last_step, window):
     for food in FOODS:
         paired = []
         for row in recent:
-            early_op = value(row, f"early_hungry_op_{food}")
+            early_op = (value(row, f"early_hungry_op_{food}") +
+                        value(row, f"middle_hungry_op_{food}"))
             late_op = value(row, f"late_hungry_op_{food}")
-            if early_op < 3 or late_op < 3:
+            if early_op < 2 or late_op < 2:
                 continue
-            early_rate = value(row, f"early_hungry_eat_{food}") / early_op
+            early_rate = (value(row, f"early_hungry_eat_{food}") +
+                          value(row, f"middle_hungry_eat_{food}")) / early_op
             late_rate = value(row, f"late_hungry_eat_{food}") / late_op
             paired.append(late_rate - early_rate)
         if paired:
             print(f"  same-animal hungry {food.upper()} acceptance change, "
-                  f"age 300+ versus 0–99: {mean(paired):+.1%} (n={len(paired)})")
+                  f"age 300+ versus 0–299: {mean(paired):+.1%} (n={len(paired)})")
         else:
             print(f"  same-animal hungry {food.upper()} acceptance: insufficient pairs")
 
     if len(recent) >= 8:
-        ordered = sorted(recent, key=lambda row: value(row, "active_neurons"))
-        size = max(1, len(ordered) // 4)
-        for label, group in (("smaller", ordered[:size]), ("larger", ordered[-size:])):
-            print(f"  {label} brain quartile: {mean(value(r, 'active_neurons') for r in group):.1f} "
-                  f"active neurons, {mean(value(r, 'age') for r in group):.0f} "
-                  f"steps lived, {mean(value(r, 'offspring') for r in group):.2f} offspring")
+        size = max(1, len(recent) // 4)
+        for trait, title in (("active_neurons", "active neurons"),
+                             ("modulatory_neurons", "modulatory neurons"),
+                             ("plastic_synapses", "plastic synapses")):
+            ordered = sorted(recent, key=lambda row: value(row, trait))
+            for label, group in (("low", ordered[:size]), ("high", ordered[-size:])):
+                print(f"  {title}, {label} quartile: {mean(value(r, trait) for r in group):.1f} "
+                      f"per animal, {mean(value(r, 'age') for r in group):.0f} "
+                      f"steps lived, {mean(value(r, 'offspring') for r in group):.2f} offspring")
         changed = sum(value(row, "mean_abs_weight_change") > 0.05 for row in recent)
         print(f"  measurable synaptic weight change (>0.05 nS): "
               f"{changed:,}/{len(recent):,} sampled lives")
@@ -100,6 +112,8 @@ def main():
           "survival selection can all affect the rates; they do not by themselves prove learning.")
     print("C has no distant sensory channel, so its approach score is a reference, "
           "not evidence that animals can see C.")
+    print("The eat motor starts with a strong bias; a high eating rate on both "
+          "stocked and empty cells is not selective feeding.")
 
 
 if __name__ == "__main__":
