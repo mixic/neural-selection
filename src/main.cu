@@ -95,6 +95,7 @@ __device__ void random_synapse(SynapseGene &g, Device d, int animal,
     g.utilization = 0.55f;
     g.recovery_ms = 450.0f;
     g.facilitation_ms = 0;
+    g.release_sites = 14;
     if (d.neurons[animal * N + g.pre].type == 0 &&
         d.neurons[animal * N + g.post].type == 1) {
         // One fitted pyramidal-to-interneuron profile in Markram et al. (1998).
@@ -141,7 +142,7 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
         random_synapse(g, d, a, rng);
         g.active = (e < 120) ? 1 : 0;
         d.synapses[a * E + e] = g;
-        d.synapse_state[a * E + e] = initial_synapse_state(g);
+        d.synapse_state[a * E + e] = initial_synapse_state(g, (uint32_t)random64(rng));
     }
     for (int s = 0; s < S; ++s) d.senses[a * S + s] = 0;
     for (int m = 0; m < M; ++m) d.motors[a * M + m] = 0;
@@ -297,6 +298,8 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
         } else if (choice == 5) {
             auto &g = d.synapses[child * E + e];
             g.initial_weight_ns = clamp(g.initial_weight_ns + (uniform(rng) - 0.5f) * 0.5f, 0.1f, 8);
+            g.release_sites = (unsigned char)clamp(
+                g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 24);
         } else if (choice == 6) {
             auto &g = d.synapses[child * E + e];
             g.plasticity = (unsigned char)randint(rng, 3);
@@ -353,7 +356,8 @@ __global__ void reproduce(Device d) {
     for (int n = 0; n < N; ++n)
         d.neuron_state[child * N + n] = initial_neuron_state(d.neurons[child * N + n]);
     for (int e = 0; e < E; ++e)
-        d.synapse_state[child * E + e] = initial_synapse_state(d.synapses[child * E + e]);
+        d.synapse_state[child * E + e] = initial_synapse_state(
+            d.synapses[child * E + e], (uint32_t)random64(rng));
     for (int s = 0; s < S; ++s) d.senses[child * S + s] = 0;
     for (int m = 0; m < M; ++m) d.motors[child * M + m] = 0;
     newborn.rng = rng;
@@ -418,7 +422,7 @@ void write_brains(const std::string &prefix, Device d) {
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
     cells << "animal_id,generation,neuron,type,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa\n";
-    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,plasticity\n";
+    edges << "animal_id,generation,synapse,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,utilization,recovery_ms,facilitation_ms,release_sites,plasticity\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = 0; n < N; ++n) {
             const auto &g = neurons[a * N + n];
@@ -434,7 +438,8 @@ void write_brains(const std::string &prefix, Device d) {
                 edges << animals[a].id << ',' << animals[a].generation << ',' << e << ','
                     << g.pre << ',' << g.post << ',' << (int)g.branch << ',' << (int)g.delay << ',' << g.initial_weight_ns << ','
                     << states[a * E + e].weight_ns << ',' << g.utilization << ','
-                    << g.recovery_ms << ',' << g.facilitation_ms << ',' << (int)g.plasticity << '\n';
+                    << g.recovery_ms << ',' << g.facilitation_ms << ','
+                    << (int)g.release_sites << ',' << (int)g.plasticity << '\n';
         }
     }
 }

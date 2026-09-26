@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 
 #ifdef __CUDACC__
 #define NS_HD __host__ __device__
@@ -33,12 +34,13 @@ struct NeuronState {
 struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
     short pre, post;
-    unsigned char delay, active, plasticity, branch;
+    unsigned char delay, active, plasticity, branch, release_sites;
 };
 struct SynapseState {
-    float weight_ns, available, running_utilization, pre_trace, post_trace;
+    float weight_ns, running_utilization, pre_trace, post_trace;
     float pre_age_ms, post_age_ms;
     int last_arrival_tick;
+    uint32_t ready_mask, rng_state;
     unsigned char arrived;
 };
 
@@ -111,27 +113,60 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
     }
 }
 
-NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g) {
-    return {g.initial_weight_ns, 1.0f, 0, 0, 0, 1000000, 1000000, -1000000, 0};
+NS_HD inline int site_count(const SynapseGene &g) {
+    return g.release_sites ? g.release_sites : 14;
+}
+
+NS_HD inline uint32_t random_bits(SynapseState &s) {
+    uint32_t x = s.rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s.rng_state = x;
+    return x;
+}
+
+NS_HD inline float release_uniform(SynapseState &s) {
+    return (random_bits(s) >> 8) * (1.0f / 16777216.0f);
+}
+
+NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
+                                                uint32_t seed = 1) {
+    uint32_t x = seed ? seed : 1;
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    if (!x) x = 1;
+    return {g.initial_weight_ns, 0, 0, 0, 1000000, 1000000,
+            -1000000, (1u << site_count(g)) - 1u, x, 0};
 }
 
 // Resource depletion (Tsodyks and Markram 1997), plus the pulse-driven
 // utilization increase measured in facilitating connections by Markram,
 // Wang and Tsodyks (1998). Returns an excitatory conductance increment.
 NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int tick) {
+    float recovery_probability = 0;
     if (s.last_arrival_tick > -1000000) {
         float elapsed = (tick - s.last_arrival_tick) * DT_MS;
-        s.available = 1.0f - (1.0f - s.available) * expf(-elapsed / g.recovery_ms);
+        recovery_probability = 1.0f - expf(-elapsed / g.recovery_ms);
         if (g.facilitation_ms > 0)
             s.running_utilization *= expf(-elapsed / g.facilitation_ms);
     }
     s.running_utilization = g.facilitation_ms > 0
         ? s.running_utilization + g.utilization * (1.0f - s.running_utilization)
         : g.utilization;
-    float fraction = s.running_utilization * s.available;
-    s.available -= fraction;
+    int released = 0;
+    for (int site = 0; site < site_count(g); ++site) {
+        uint32_t bit = 1u << site;
+        if (!(s.ready_mask & bit) && release_uniform(s) < recovery_probability)
+            s.ready_mask |= bit;
+        if ((s.ready_mask & bit) && release_uniform(s) < s.running_utilization) {
+            s.ready_mask &= ~bit;
+            ++released;
+        }
+    }
     s.last_arrival_tick = tick;
-    return s.weight_ns * fraction;
+    return s.weight_ns * released / site_count(g);
 }
 
 // Plasticity profile 1: cultured hippocampal pairs in Bi and Poo (1998).
