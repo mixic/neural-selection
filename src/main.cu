@@ -814,7 +814,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             auto &g = d.synapses[e];
             g.initial_weight_ns = clamp(g.initial_weight_ns + (uniform(rng) - 0.5f) * 0.5f, 0.1f, 8);
             g.release_sites = (unsigned char)clamp(
-                g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 24);
+                g.release_sites + (uniform(rng) < 0.5f ? -1 : 1), 1, 64);
         } else if (choice == 6 && e >= 0) {
             auto &g = d.synapses[e];
             g.plasticity = (unsigned char)randint(rng, 6);

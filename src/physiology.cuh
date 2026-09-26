@@ -53,7 +53,8 @@ struct SynapseState {
     float spine_volume, structural_age_ms;
     float pre_age_ms, post_age_ms;
     int64_t last_arrival_tick;
-    uint32_t ready_mask, rng_state;
+    uint64_t ready_mask;
+    uint32_t rng_state;
     unsigned char arrived;
 };
 
@@ -225,7 +226,7 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
 }
 
 NS_HD inline int site_count(const SynapseGene &g) {
-    return g.release_sites ? g.release_sites : 14;
+    return g.release_sites ? (g.release_sites > 64 ? 64 : g.release_sites) : 14;
 }
 
 NS_HD inline uint32_t random_bits(SynapseState &s) {
@@ -250,7 +251,8 @@ NS_HD inline SynapseState initial_synapse_state(const SynapseGene &g,
     if (!x) x = 1;
     return {g.initial_weight_ns, 0, 0, 0, 0, 0, -1, 1, -1,
             1000000, 1000000,
-            -1000000, (1u << site_count(g)) - 1u, x, 0};
+            -1000000, site_count(g) == 64 ? ~uint64_t(0) :
+            (uint64_t(1) << site_count(g)) - 1, x, 0};
 }
 
 // Fitted temporal envelope for dopamine-sensitive eligibility at striatal
@@ -285,7 +287,7 @@ NS_HD inline float synapse_release(const SynapseGene &g, SynapseState &s, int64_
         : g.utilization;
     int released = 0;
     for (int site = 0; site < site_count(g); ++site) {
-        uint32_t bit = 1u << site;
+        uint64_t bit = uint64_t(1) << site;
         if (!(s.ready_mask & bit) && release_uniform(s) < recovery_probability)
             s.ready_mask |= bit;
         if ((s.ready_mask & bit) && release_uniform(s) < s.running_utilization) {

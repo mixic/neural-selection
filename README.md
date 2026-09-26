@@ -67,6 +67,6 @@ A 2,000-step GPU run with deletion mutations completed with 1,385 births. It che
 
 ## Evidence and limits
 
-[EXPERIMENTS.md](EXPERIMENTS.md) lists the original experimental protocols, our results, what was fitted versus checked, and remaining gaps. The protocol checks run with `./build/physiology_protocols` or `ctest`.
+[EXPERIMENTS.md](EXPERIMENTS.md) lists the original experimental protocols, our results, what was fitted versus checked, and remaining gaps. The protocol checks run with `./build/physiology_protocols` or `ctest`. The separate `./build/sensory_relay_protocols` diagnostic compares the current sensory pathway with published fruit-fly recordings and reports substantial unresolved mismatches; it is not a passing biological reproduction.
 
 These checks establish a few local response patterns, not a validated biological brain. In particular, the dendritic branches are phenomenological rather than explicit membranes, and the model omits detailed ion channels, variable quantum size, synapse-specific molecular machinery, development, and evidence-based sensory transduction. The neuron fits come from mammalian cortex; plasticity checks draw on cortical, cultured hippocampal, and striatal experiments. None validates an insect brain or complex learned behaviour in the evolving world.
