@@ -197,12 +197,14 @@ int main() {
     orn.slow_recovery_ms = 7500.0f;
     orn.slow_depletion = 0.023f;
     auto orn_single = single_axon(orn);
-    auto orn_train = train(orn, 50);
+    auto orn_train_20 = train(orn, 20);
+    auto orn_train_50 = train(orn, 50);
     std::cout << "orn_pn_candidate epsc_pa=" << orn_single.epsc_pa
               << " epsp_mv=" << orn_single.epsp_mv
               << " current_cv=" << orn_single.cv
-              << " basal_ratio=" << orn_train.basal_end_pa / orn_train.first_pa
-              << " challenge_last_pa=" << orn_train.challenge_last_pa
+              << " basal_ratio=" << orn_train_20.basal_end_pa / orn_train_20.first_pa
+              << " challenge_20_last_pa=" << orn_train_20.challenge_last_pa
+              << " challenge_50_last_pa=" << orn_train_50.challenge_last_pa
               << " recovery_1s=" << recovery_after_pause(orn, 1000)
               << " recovery_7p5s=" << recovery_after_pause(orn, 7500) << '\n';
     for (float bias : {0.0f, 50.0f, 100.0f})
@@ -255,11 +257,14 @@ int main() {
     }
     auto pn_pulse = single_axon(orn, 1000, pn);
     auto basal = train(orn, 20);
+    auto strong_train = train(orn, 50);
     auto weak = odor_step(40, 20, orn, pn);
     auto strong = odor_step(40, 50, orn, pn);
     bool reproduced = std::abs(pn_pulse.epsc_pa - 29.0) < 2.6 &&
         std::abs(pn_pulse.epsp_mv - 6.19) < 0.45 &&
         std::abs(basal.basal_end_pa / basal.first_pa - 0.60) < 0.08 &&
+        basal.challenge_last_pa < basal.basal_end_pa &&
+        strong_train.challenge_last_pa < basal.challenge_last_pa &&
         std::abs(recovery_after_pause(orn, 7500) - 0.85) < 0.06 &&
         weak.odor_spikes > weak.baseline_spikes &&
         strong.onset_spikes > strong.late_spikes;
