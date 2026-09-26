@@ -130,6 +130,8 @@ void LiveView::handle_client(int client) {
         send_response(client, 200, "text/html; charset=utf-8", asset("index.html"));
     } else if (line == "GET /style.css HTTP/1.1") {
         send_response(client, 200, "text/css; charset=utf-8", asset("style.css"));
+    } else if (line == "GET /behavior.css HTTP/1.1") {
+        send_response(client, 200, "text/css; charset=utf-8", asset("behavior.css"));
     } else if (line == "GET /app.js HTTP/1.1") {
         send_response(client, 200, "text/javascript; charset=utf-8", asset("app.js"));
     } else {

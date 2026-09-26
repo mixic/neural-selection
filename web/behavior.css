@@ -1,0 +1,11 @@
+.food-choice h2{font-family:'Space Grotesk',sans-serif;font-size:19px;margin:18px 0 5px}
+.food-choice p,.choice-note{color:var(--muted);font-size:11px;line-height:1.5}
+.choice-row{margin-top:17px}
+.choice-row>div:first-child{display:flex;justify-content:space-between;font-size:12px}
+.choice-row strong{font-family:'Space Grotesk',sans-serif}
+.choice-track{height:7px;border-radius:8px;background:#293b39;margin:7px 0;overflow:hidden}
+.choice-track i{display:block;height:100%;background:var(--lime)}
+.choice-row:nth-child(2) .choice-track i{background:var(--orange)}
+.choice-row:nth-child(3) .choice-track i{background:var(--blue)}
+.choice-row small{color:var(--muted);font-size:10px}
+.choice-note{border-top:1px solid var(--line);margin-top:20px;padding-top:14px}

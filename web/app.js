@@ -227,6 +227,13 @@ function updateUI(data) {
   $('end').disabled = data.finished;
   for (const speed of ['1', '4', '0'])
     $(`speed${speed}`).classList.toggle('active', data.speed === Number(speed));
+  const foodNames = ['A · nutritious', 'B · harmful', 'C · inert'];
+  $('choice-rows').innerHTML = (data.food_choice || []).map((item, i) => {
+    const accepted = item[0], opportunities = item[1];
+    const share = opportunities ? accepted / opportunities : 0;
+    const alignment = item[3] ? item[2] / item[3] : 0;
+    return `<div class="choice-row"><div><span>${foodNames[i]}</span><strong>${opportunities ? (share * 100).toFixed(1) + '%' : '—'}</strong></div><div class="choice-track"><i style="width:${(share * 100).toFixed(1)}%"></i></div><small>${fmt(opportunities)} encounters · approach ${alignment >= 0 ? '+' : ''}${alignment.toFixed(2)}</small></div>`;
+  }).join('');
   updateInspector();
 }
 

@@ -25,6 +25,18 @@ Architecture `86` targets an RTX 3080; change it for another GPU. On this machin
 
 Each world step advances the neural simulation by 16 one-millisecond ticks. The program writes population history to the requested CSV, an image to `<output>.png`, and final genomes and synaptic weights to `<output>.neurons.csv` and `<output>.synapses.csv`. The brain tables include allocated inactive genes, global neuron/synapse slot IDs, and fixed port numbers (`-1` means hidden). White pixels in the image are animals; green, orange, and blue represent the three food types. Runs with the same seed may differ because animals contend for resources and birth slots through GPU atomics.
 
+## Observing behaviour
+
+The simulation also writes cumulative food-choice and movement measurements to `<output>.behavior.csv` every 100 world steps, plus a 10% deterministic sample of completed lifetimes to `<output>.lives.csv`. The live view shows recent hungry food-choice rates. Summarize an active or finished run with:
+
+```sh
+python3 tools/analyze_behavior.py run.csv
+```
+
+An *opportunity* means an animal ends a step on a stocked food cell; *accepted* means its eat output fires and it successfully harvests that cell. Counts are split by food A/B/C, energy below or at least 16 at the start of the step, and animal age 0–99, 100–299, or 300+ steps. Hungry approach alignment compares movement toward the nearest stocked cell of each type within four cells against distance traveled; +1 is straight toward it, −1 straight away. These observations are never provided to the brain as rewards or fitness signals. A and B have distant directional senses, while C currently has only a taste signal after eating, so C approach is a reference rather than a test of C vision.
+
+The lifetime sample records age at death, cause (1 predation, 2 energy depletion, 3 other health loss, 4 age limit), offspring count, brain size, modulatory and plastic synapse counts, synaptic weight change, and the same food-choice counters. It supports comparisons within the same animal and across brain types. Such associations can suggest adaptation, but age, survival selection, and genotype differences can mimic learning; they do not by themselves prove it.
+
 ## Ecology
 
 There are no fixed predator and prey species. Every animal can detect other animals in three directions and has a separate neural bite output. A bite costs energy, injures a co-located animal, and gives that animal a pain signal. A lethal bite transfers 45% of the prey's remaining energy to the attacker and activates a meat-taste signal. Predation therefore transfers existing energy rather than adding a reward signal. Whether animals hunt or avoid others depends on their evolving circuits.
