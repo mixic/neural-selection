@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include "lp_cell.cuh"
 
 #ifdef __CUDACC__
 #define NS_HD __host__ __device__
@@ -29,10 +30,12 @@ struct NeuronGene {
     float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv, bias_pa;
     float afterdepol_spike_pa, afterdepol_tau_ms;
     unsigned char type, active, modulator;
+    LPConductance lp_scale;
 };
 struct NeuronState {
     float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
     float dendrite_exc_ns[DENDRITES];
+    LPCell lp;
     int total_spikes;
     unsigned char spike;
 };
@@ -71,9 +74,26 @@ NS_HD inline NeuronGene cortical_l5_profile() {
     return g;
 }
 
+NS_HD inline NeuronGene lobster_lp_profile() {
+    NeuronGene g = recorded_profile(1);
+    g.type = 2;
+    g.lp_scale = {1, 1, 1, 1};
+    return g;
+}
+
+NS_HD inline NeuronGene initial_profile(unsigned char type) {
+    return type == 0 ? cortical_l5_profile() :
+           (type == 1 ? recorded_profile(1) : lobster_lp_profile());
+}
+
+
 NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
     NeuronState state{};
     state.voltage_mv = g.rest_mv;
+    if (g.type == 2) {
+        state.lp = initial_lp_cell();
+        state.voltage_mv = state.lp.x[15] - 9.342518882f;
+    }
     return state;
 }
 
@@ -123,6 +143,23 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
     s.recent_depol_mv += 0.1f * (subthreshold - s.recent_depol_mv);
     s.inh_ns += incoming_inh_ns;
     s.spike = 0;
+    if (g.type == 2) {
+        float old_axon = s.lp.x[0];
+        float excitation = 0;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            excitation += s.dendrite_exc_ns[branch];
+        float external_pa = current_pa +
+            excitation * (EXC_REVERSAL_MV - s.voltage_mv) +
+            s.inh_ns * (INH_REVERSAL_MV - s.voltage_mv);
+        lp_advance(s.lp, external_pa / 1000.0f, g.lp_scale);
+        s.voltage_mv = s.lp.x[15] - 9.342518882f;
+        s.spike = old_axon < 0 && s.lp.x[0] >= 0;
+        s.total_spikes += s.spike;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            s.dendrite_exc_ns[branch] *= expf(-DT_MS / EXC_DECAY_MS);
+        s.inh_ns *= expf(-DT_MS / INH_DECAY_MS);
+        return;
+    }
     constexpr int substeps = 4;
     constexpr float h = DT_MS / substeps;
     for (int step = 0; step < substeps; ++step) {
