@@ -34,6 +34,11 @@ struct NeuronGene {
     LPConductance lp_scale;
     PrinzConductance prinz_g;
     float prinz_ambient_leak_ns;
+    // A sensory channel can be read by multiple independently spiking cells.
+    // -1 means no direct receptor input; channel numbers are world-defined.
+    signed char sensory_channel = -1;
+    float receptor_baseline_hz = 0, receptor_gain_hz = 0;
+    float receptor_event_ns = 0, receptor_decay_ms = 3;
 };
 struct NeuronState {
     float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
@@ -41,6 +46,8 @@ struct NeuronState {
     union { LPCell lp; PrinzCell prinz; };
     int total_spikes;
     unsigned char spike;
+    float receptor_ns;
+    uint32_t receptor_rng;
 };
 struct SynapseGene {
     float initial_weight_ns, utilization, recovery_ms, facilitation_ms;
@@ -96,6 +103,27 @@ NS_HD inline NeuronGene crab_pacemaker_profile() {
     return g;
 }
 
+// Effective olfactory receptor neuron. Receptor event statistics are fitted
+// against measured spontaneous and odor-driven spike rates in a separate
+// protocol; event conductance is not a measured single-channel value.
+NS_HD inline NeuronGene orn_receptor_profile() {
+    NeuronGene g = recorded_profile(0);
+    g.type = 5;
+    g.capacitance_pf = 10.0f;
+    g.leak_ns = 0.5f;
+    g.rest_mv = -60.0f;
+    g.threshold_mv = -40.0f;
+    g.reset_mv = -60.0f;
+    g.adapt_ns = 0;
+    g.spike_adapt_pa = 0;
+    g.bias_pa = 0;
+    g.receptor_baseline_hz = 7.0f;
+    g.receptor_gain_hz = 43.0f;
+    g.receptor_event_ns = 2.0f;
+    g.receptor_decay_ms = 3.0f;
+    return g;
+}
+
 // Effective PN relay profile for the ORN-to-PN protocol. Capacitance and leak
 // are fitted to the published unitary EPSP and the author's passive-model
 // decay; they are not measurements of a physical PN compartment.
@@ -113,20 +141,27 @@ NS_HD inline NeuronGene pn_relay_profile() {
 }
 
 NS_HD inline bool excitatory_type(unsigned char type) {
-    return type == 0 || type == 4;
+    return type == 0 || type == 4 || type == 5;
 }
 
 NS_HD inline NeuronGene initial_profile(unsigned char type) {
     return type == 0 ? cortical_l5_profile() :
            (type == 1 ? recorded_profile(1) :
            (type == 2 ? lobster_lp_profile() :
-            (type == 3 ? crab_pacemaker_profile() : pn_relay_profile())));
+            (type == 3 ? crab_pacemaker_profile() :
+             (type == 4 ? pn_relay_profile() : orn_receptor_profile()))));
 }
 
 
-NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
+NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g,
+                                              uint32_t seed = 1) {
     NeuronState state{};
     state.voltage_mv = g.rest_mv;
+    uint32_t x = seed ? seed : 1;
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    state.receptor_rng = x ? x : 1;
     if (g.type == 2) {
         state.lp = initial_lp_cell();
         state.voltage_mv = state.lp.x[15] - 9.342518882f;
@@ -136,6 +171,23 @@ NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g) {
         state.voltage_mv = state.prinz.v;
     }
     return state;
+}
+
+// Independently sampled receptor events produce a conductance that enters
+// the ordinary membrane equation. Spikes still require voltage integration.
+NS_HD inline float receptor_current(const NeuronGene &g, NeuronState &s,
+                                    float sensory_level) {
+    if (g.sensory_channel < 0 || g.receptor_event_ns <= 0) return 0;
+    float rate_hz = bound(g.receptor_baseline_hz +
+                          g.receptor_gain_hz * sensory_level, 0, 1000);
+    s.receptor_rng ^= s.receptor_rng << 13;
+    s.receptor_rng ^= s.receptor_rng >> 17;
+    s.receptor_rng ^= s.receptor_rng << 5;
+    float u = (s.receptor_rng >> 8) * (1.0f / 16777216.0f);
+    s.receptor_ns *= expf(-DT_MS / g.receptor_decay_ms);
+    if (u < rate_hz * (DT_MS / 1000.0f))
+        s.receptor_ns += g.receptor_event_ns;
+    return s.receptor_ns * (EXC_REVERSAL_MV - s.voltage_mv);
 }
 
 // Phenomenological thin-branch input/output curve: linear for weak inputs,
