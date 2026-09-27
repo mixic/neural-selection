@@ -312,10 +312,6 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
             g.modulator = u < 0.04f ? 1 : (u < 0.08f ? 2 :
                           (u < 0.12f ? 3 : 0));
         }
-        g.bias_pa = type >= 2 ? 0.0f : (port == S ? uniform(rng) * 140.0f :
-            (port > S && port < S + M - 1
-                ? 110.0f + uniform(rng) * 90.0f
-                : uniform(rng) * 100.0f));
         g.active = port >= 0 || type == 5 || uniform(rng) < 0.5f;
         initialize_neuron(d, n, a, port, g, body.neuron_head,
                           (uint32_t)random64(rng));
@@ -443,7 +439,7 @@ __global__ void neuron_step(Device d, int64_t tick) {
         sensory = g.type == 5 && g.sensory_channel < 6
             ? receptor_current(g, state, level) : level * 230.0f;
     }
-    neuron_advance(g, state, g.bias_pa + sensory, exc, inh);
+    neuron_advance(g, state, sensory, exc, inh);
     if (state.spike && port >= S && port < S + M)
         atomicAdd(&d.motors[a * M + port - S], 1);
     d.spike_history[(tick % HISTORY) * NEURON_CAPACITY + i] = state.spike;
@@ -759,7 +755,6 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                     }
                     unsigned char type = (unsigned char)randint(rng, 5);
                     NeuronGene g = initial_profile(type);
-                    g.bias_pa = type >= 2 ? 0.0f : uniform(rng) * 100.0f;
                     g.modulator = uniform(rng) < 0.12f ?
                         (unsigned char)(1 + randint(rng, 3)) : 0;
                     initialize_neuron(d, added, child, -1, g, body.neuron_head,
@@ -827,8 +822,6 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                     g.receptor_decay_ms * (0.9f + uniform(rng) * 0.2f), 1, 20);
             } else {
                 g.threshold_mv = clamp(g.threshold_mv + (uniform(rng) - 0.5f) * 2, -60, -35);
-                if (g.sensory_channel < 0)
-                    g.bias_pa = clamp(g.bias_pa + (uniform(rng) - 0.5f) * 20, -50, 250);
             }
         } else if (choice == 3) {
             float action = uniform(rng);
@@ -917,7 +910,6 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                         ? afferent : body.ports[randint(rng, S)];
                     NeuronGene g = d.neurons[source];
                     g.modulator = 0;
-                    g.bias_pa = 0;
                     g.active = 1;
                     initialize_neuron(d, added, child, -1, g, body.neuron_head,
                                       (uint32_t)random64(rng));
@@ -954,7 +946,6 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 unsigned char active = g.active;
                 if (g.type == 5 && channel >= 6) {
                     g = cortical_l5_profile();
-                    g.bias_pa = 0;
                 } else if (g.type != 5 && channel < 6) {
                     g = orn_receptor_profile();
                 }
@@ -1102,7 +1093,7 @@ void write_brains(const std::string &prefix, Device d) {
     download(neuron_port, d.neuron_port, NEURON_CAPACITY);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,port,active,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,bias_pa,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
+    cells << "animal_id,generation,neuron,port,active,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
     edges << "animal_id,generation,synapse,active,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors,slow_recovery_ms,slow_depletion\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = animals[a].neuron_head, visited = 0;
@@ -1115,7 +1106,7 @@ void write_brains(const std::string &prefix, Device d) {
                 << g.capacitance_pf << ',' << g.leak_ns << ','
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
-                << g.reset_mv << ',' << g.bias_pa << ','
+                << g.reset_mv << ','
                 << g.afterdepol_spike_pa << ',' << g.afterdepol_tau_ms << ','
                 << expf(neuron_states[n].log_ampa_scale) << ','
                 << g.lp_scale.calcium << ',' << g.lp_scale.calcium_k << ','

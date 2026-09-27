@@ -91,13 +91,13 @@ static double recovery_after_pause(SynapseGene gene, int pause_ms,
     return recovered / first;
 }
 
-static int sensory_spikes(float sense, float bias_pa = 0,
+static int sensory_spikes(float sense, float injected_current_pa = 0,
                          int duration_ms = 500) {
     auto gene = cortical_l5_profile();
     auto state = initial_neuron_state(gene);
     float no_input[DENDRITES]{};
     for (int t = 0; t < duration_ms; ++t)
-        neuron_advance(gene, state, bias_pa + 230.0f * sense, no_input, 0);
+        neuron_advance(gene, state, injected_current_pa + 230.0f * sense, no_input, 0);
     return state.total_spikes;
 }
 
@@ -358,10 +358,11 @@ int main() {
               << " challenge_50_last_pa=" << orn_train_50.challenge_last_pa
               << " recovery_1s=" << recovery_after_pause(orn, 1000)
               << " recovery_7p5s=" << recovery_after_pause(orn, 7500) << '\n';
-    for (float bias : {0.0f, 50.0f, 100.0f})
+    for (float injected_current : {0.0f, 50.0f, 100.0f})
         for (float level : {0.0f, 0.125f, 0.25f, 0.5f, 1.0f})
-            std::cout << "sensory_bias_" << bias << "_level_" << level
-                      << " spikes_500ms=" << sensory_spikes(level, bias) << '\n';
+            std::cout << "sensory_injected_current_" << injected_current
+                      << "_level_" << level
+                      << " spikes_500ms=" << sensory_spikes(level, injected_current) << '\n';
     for (int inputs : {1, 2, 4, 8, 16})
         std::cout << "convergence_" << inputs << " spikes_500ms="
                   << convergent_spikes(inputs, 20, generic) << '\n';

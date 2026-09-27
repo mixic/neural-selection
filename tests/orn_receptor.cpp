@@ -24,7 +24,6 @@ static double response_rate(NeuronGene gene, float sensory_level,
 
 int main() {
     auto receptor = orn_receptor_profile();
-    if (receptor.bias_pa != 0) return EXIT_FAILURE;
     double spontaneous = response_rate(receptor, 0);
     double weak = response_rate(receptor, 0.3f);
     double strong = response_rate(receptor, 1);

@@ -28,7 +28,7 @@ constexpr unsigned char MOD_DA = 4;
 // 0: regular-spiking pyramidal cell; 1: continuously non-adapting interneuron.
 struct NeuronGene {
     float capacitance_pf, leak_ns, rest_mv, threshold_mv, slope_mv;
-    float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv, bias_pa;
+    float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv;
     float afterdepol_spike_pa, afterdepol_tau_ms;
     unsigned char type, active, modulator;
     LPConductance lp_scale;
@@ -73,8 +73,8 @@ NS_HD inline float bound(float x, float low, float high) {
 }
 
 NS_HD inline NeuronGene recorded_profile(unsigned char type) {
-    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 0, 1, 1, 0};
-    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 0, 1, 0};
+    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 1, 1, 0};
+    return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 1, 0};
 }
 
 // Visual-cortex L5 protocol profile. The Naud step-current fit above remains
@@ -98,7 +98,6 @@ NS_HD inline NeuronGene lobster_lp_profile() {
 NS_HD inline NeuronGene crab_pacemaker_profile() {
     NeuronGene g = recorded_profile(1);
     g.type = 3;
-    g.bias_pa = 0;
     g.prinz_g = prinz_pacemaker_conductance();
     return g;
 }
@@ -116,7 +115,6 @@ NS_HD inline NeuronGene orn_receptor_profile() {
     g.reset_mv = -60.0f;
     g.adapt_ns = 0;
     g.spike_adapt_pa = 0;
-    g.bias_pa = 0;
     g.receptor_baseline_hz = 7.0f;
     g.receptor_gain_hz = 43.0f;
     g.receptor_event_ns = 2.0f;
