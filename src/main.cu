@@ -70,6 +70,7 @@ struct LifeRecord {
 };
 struct Device {
     int initial_count;
+    int trace_animal;
     Animal *animals;
     NeuronGene *neurons;
     SynapseGene *synapses;
@@ -84,6 +85,8 @@ struct Device {
     int *active_neuron_counts, *active_synapse_counts;
     unsigned char *bite_intent;
     int *motors, *food, *kind, *cell_head, *cell_next;
+    int *trace_exc_arrivals, *trace_exc_releases, *trace_inh_arrivals;
+    float *trace_exc_ns, *trace_inh_ns, *trace_peak_mv;
     int *founder_motor_steps, *founder_observed_steps;
     int *births, *deaths, *predation_deaths, *bites, *next_id;
     LifeRecord *life_records;
@@ -399,18 +402,30 @@ __global__ void synapse_delivery(Device d, int64_t tick) {
         NeuronGene source = d.neurons[g.pre];
         float released = excitatory_type(source.type) || source.modulator
             ? synapse_release(g, state, tick) : state.weight_ns;
+        int motor = d.neuron_port[g.post] - S;
+        bool traced_motor = a == d.trace_animal && motor >= 0 && motor < M;
         if (source.modulator) {
             if (released > 0)
                 atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1],
                           static_cast<unsigned long long>(tick + 1));
         } else if (excitatory_type(source.type)) {
+            if (traced_motor) {
+                atomicAdd(&d.trace_exc_arrivals[motor], 1);
+                if (released > 0) atomicAdd(&d.trace_exc_releases[motor], 1);
+                atomicAdd(&d.trace_exc_ns[motor], released);
+            }
             float postsynaptic_scale = expf(
                 d.neuron_state[g.post].log_ampa_scale);
             atomicAdd(&d.pending_exc[g.post * DENDRITES + g.branch],
                       released * postsynaptic_scale);
         }
-        else
+        else {
+            if (traced_motor) {
+                atomicAdd(&d.trace_inh_arrivals[motor], 1);
+                atomicAdd(&d.trace_inh_ns[motor], released);
+            }
             atomicAdd(&d.pending_inh[g.post], released);
+        }
     }
     d.synapse_state[i] = state;
 }
@@ -440,6 +455,9 @@ __global__ void neuron_step(Device d, int64_t tick) {
             ? receptor_current(g, state, level) : level * 230.0f;
     }
     neuron_advance(g, state, sensory, exc, inh);
+    if (a == d.trace_animal && port >= S && port < S + M)
+        d.trace_peak_mv[port - S] = fmaxf(d.trace_peak_mv[port - S],
+                                         state.voltage_mv);
     if (state.spike && port >= S && port < S + M)
         atomicAdd(&d.motors[a * M + port - S], 1);
     d.spike_history[(tick % HISTORY) * NEURON_CAPACITY + i] = state.spike;
@@ -1222,6 +1240,7 @@ int main(int argc, char **argv) {
     int64_t steps = 2000;
     int initial = 1024;
     int live_port = 8765;
+    int trace_animal = -1;
     bool visualize = false, steps_specified = false;
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
@@ -1238,11 +1257,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
         else if (!strcmp(argv[i], "--visualize")) visualize = true;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) live_port = atoi(argv[++i]);
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535]\n"; return 2; }
+        else if (!strcmp(argv[i], "--trace-animal") && i + 1 < argc)
+            trace_animal = atoi(argv[++i]);
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot]\n"; return 2; }
     }
     if (visualize && !steps_specified) steps = 0;
     if (steps < 0 || steps > INT64_MAX / TICKS ||
-        initial < 1 || initial > P || !std::isfinite(food_renewal) ||
+        initial < 1 || initial > P || trace_animal >= initial || trace_animal < -1 ||
+        !std::isfinite(food_renewal) ||
         food_renewal < 0 || food_renewal > 1 || live_port < 1 || live_port > 65535) {
         std::cerr << "Invalid steps, population, food renewal, or port\n"; return 2;
     }
@@ -1261,6 +1283,7 @@ int main(int argc, char **argv) {
     if (count < 1) { std::cerr << "No NVIDIA GPU found\n"; return 1; }
     Device d{};
     d.initial_count = initial;
+    d.trace_animal = trace_animal;
     allocate(d.animals, P);
     allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);
     allocate(d.neuron_state, NEURON_CAPACITY);
@@ -1281,6 +1304,9 @@ int main(int argc, char **argv) {
     allocate(d.spike_history, HISTORY * NEURON_CAPACITY);
     allocate(d.senses, P * S);
     allocate(d.motors, P * M); allocate(d.bite_intent, P);
+    allocate(d.trace_exc_arrivals, M); allocate(d.trace_exc_releases, M);
+    allocate(d.trace_inh_arrivals, M); allocate(d.trace_exc_ns, M);
+    allocate(d.trace_inh_ns, M); allocate(d.trace_peak_mv, M);
     allocate(d.founder_motor_steps, M);
     allocate(d.founder_observed_steps, 1);
     allocate(d.food, W * H); allocate(d.kind, W * H);
@@ -1304,6 +1330,14 @@ int main(int argc, char **argv) {
     check(cudaMemset(d.bites, 0, sizeof(int)), "counter reset");
     check(cudaMemset(d.life_count, 0, sizeof(int)), "life record reset");
     check(cudaMemset(d.founder_motor_steps, 0, M * sizeof(int)), "founder activity reset");
+    check(cudaMemset(d.trace_exc_arrivals, 0, M * sizeof(int)), "trace reset");
+    check(cudaMemset(d.trace_exc_releases, 0, M * sizeof(int)), "trace reset");
+    check(cudaMemset(d.trace_inh_arrivals, 0, M * sizeof(int)), "trace reset");
+    check(cudaMemset(d.trace_exc_ns, 0, M * sizeof(float)), "trace reset");
+    check(cudaMemset(d.trace_inh_ns, 0, M * sizeof(float)), "trace reset");
+    float trace_peak_reset[M] = {-100, -100, -100, -100, -100};
+    check(cudaMemcpy(d.trace_peak_mv, trace_peak_reset, sizeof(trace_peak_reset),
+                     cudaMemcpyHostToDevice), "trace reset");
     check(cudaMemset(d.founder_observed_steps, 0, sizeof(int)), "founder activity reset");
     check(cudaMemcpy(d.next_id, &initial, sizeof(int), cudaMemcpyHostToDevice), "counter init");
     init_world<<<(W * H + 255) / 256, 256>>>(d, seed);
@@ -1533,6 +1567,36 @@ int main(int argc, char **argv) {
         report(last_step, true);
     write_world(output + ".png", d);
     write_brains(output, d);
+    if (trace_animal >= 0) {
+        int exc_arrivals[M], exc_releases[M], inh_arrivals[M];
+        float exc_ns[M], inh_ns[M], peak_mv[M];
+        check(cudaMemcpy(exc_arrivals, d.trace_exc_arrivals, sizeof(exc_arrivals),
+                         cudaMemcpyDeviceToHost), "trace download");
+        check(cudaMemcpy(exc_releases, d.trace_exc_releases, sizeof(exc_releases),
+                         cudaMemcpyDeviceToHost), "trace download");
+        check(cudaMemcpy(inh_arrivals, d.trace_inh_arrivals, sizeof(inh_arrivals),
+                         cudaMemcpyDeviceToHost), "trace download");
+        check(cudaMemcpy(exc_ns, d.trace_exc_ns, sizeof(exc_ns),
+                         cudaMemcpyDeviceToHost), "trace download");
+        check(cudaMemcpy(inh_ns, d.trace_inh_ns, sizeof(inh_ns),
+                         cudaMemcpyDeviceToHost), "trace download");
+        check(cudaMemcpy(peak_mv, d.trace_peak_mv, sizeof(peak_mv),
+                         cudaMemcpyDeviceToHost), "trace download");
+        std::ofstream trace(output + ".trace.csv");
+        trace << "motor,excitatory_arrivals,nonzero_releases,total_excitatory_ns,"
+                 "inhibitory_arrivals,total_inhibitory_ns,peak_voltage_mv,spikes\n";
+        const char *names[M] = {"forward", "left", "right", "eat", "bite"};
+        for (int m = 0; m < M; ++m) {
+            int motor_neuron = bodies[trace_animal].ports[S + m];
+            NeuronState state{};
+            if (motor_neuron >= 0)
+                check(cudaMemcpy(&state, d.neuron_state + motor_neuron,
+                                 sizeof(state), cudaMemcpyDeviceToHost), "trace download");
+            trace << names[m] << ',' << exc_arrivals[m] << ',' << exc_releases[m]
+                  << ',' << exc_ns[m] << ',' << inh_arrivals[m] << ',' << inh_ns[m]
+                  << ',' << peak_mv[m] << ',' << state.total_spikes << '\n';
+        }
+    }
     std::cout << "Wrote " << output << ", world image, and final brain tables\n";
     if (live) {
         live->finish();
@@ -1551,6 +1615,9 @@ int main(int argc, char **argv) {
     cudaFree(d.pending_exc); cudaFree(d.pending_inh); cudaFree(d.mod_event_tick);
     cudaFree(d.spike_history);
     cudaFree(d.bite_intent);
+    cudaFree(d.trace_exc_arrivals); cudaFree(d.trace_exc_releases);
+    cudaFree(d.trace_inh_arrivals); cudaFree(d.trace_exc_ns);
+    cudaFree(d.trace_inh_ns); cudaFree(d.trace_peak_mv);
     cudaFree(d.founder_motor_steps); cudaFree(d.founder_observed_steps);
     cudaFree(d.senses); cudaFree(d.motors);
     cudaFree(d.food); cudaFree(d.kind); cudaFree(d.cell_head); cudaFree(d.cell_next);

@@ -41,6 +41,8 @@ The lifetime sample records age at death, cause (1 predation, 2 energy depletion
 
 With inherited constant current removed, `--steps 5000 --population 2048 --seed 1` produced no motor spikes or births. All founders died by step 3,800. In a matching 2,000-step trial, all 12,288 active food receptor neurons fired, and 22,563 active hidden neurons fired, but none of the 10,240 motor neurons did. This establishes a current sensory-to-motor propagation gap in randomly initialized brains; it does not show that the biological neuron mechanisms require a constant bias.
 
+To inspect one founding animal's motor inputs, add `--trace-animal N` with a founder slot number from `0` through `population - 1`. The run writes `<output>.trace.csv` with excitatory and inhibitory synapse arrivals, released conductance, maximum motor voltage, and motor spikes. Choose a run that ends before that founder dies, since slots can be reused after death.
+
 ## Ecology
 
 There are no fixed predator and prey species. Every animal can detect other animals in three directions and has a separate neural bite output. A bite costs energy, injures a co-located animal, and gives that animal a pain signal. A lethal bite transfers 45% of the prey's remaining energy to the attacker and activates a meat-taste signal. Predation therefore transfers existing energy rather than adding a reward signal. Whether animals hunt or avoid others depends on their evolving circuits.
