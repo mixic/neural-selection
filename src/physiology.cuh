@@ -42,10 +42,14 @@ struct NeuronGene {
     float receptor_baseline_hz = 0, receptor_gain_hz = 0;
     float receptor_event_ns = 0, receptor_decay_ms = 3;
 };
+struct LFSCell {
+    float voltage_mv, threshold_mv;
+    float activated[3], open[3];
+};
 struct NeuronState {
     float voltage_mv, adaptation_pa, afterdepol_pa, inh_ns, recent_depol_mv, log_ampa_scale;
     float dendrite_exc_ns[DENDRITES];
-    union { LPCell lp; PrinzCell prinz; };
+    union { LPCell lp; PrinzCell prinz; LFSCell lfs; };
     int total_spikes;
     unsigned char spike;
     float receptor_ns;
@@ -144,6 +148,19 @@ NS_HD inline NeuronGene pn_relay_profile() {
     return g;
 }
 
+// Aplysia LFS siphon motor cell: measured passive properties from Lieb and
+// Frost (1997), Table 1. The threshold reset and spike undershoot below use
+// Table 2. Their high-current voltage-dependent shunts are not included.
+NS_HD inline NeuronGene aplysia_lfs_profile() {
+    NeuronGene g = recorded_profile(0);
+    g.type = 6;
+    g.capacitance_pf = 1200.0f;
+    g.leak_ns = 1000.0f / 65.6f;
+    g.rest_mv = -45.1f;
+    g.threshold_mv = -51.8f;
+    return g;
+}
+
 NS_HD inline bool excitatory_type(unsigned char type) {
     return type == 0 || type == 4 || type == 5;
 }
@@ -153,7 +170,8 @@ NS_HD inline NeuronGene initial_profile(unsigned char type) {
            (type == 1 ? recorded_profile(1) :
            (type == 2 ? lobster_lp_profile() :
             (type == 3 ? crab_pacemaker_profile() :
-             (type == 4 ? pn_relay_profile() : orn_receptor_profile()))));
+             (type == 4 ? pn_relay_profile() :
+              (type == 5 ? orn_receptor_profile() : aplysia_lfs_profile())))));
 }
 
 
@@ -173,6 +191,11 @@ NS_HD inline NeuronState initial_neuron_state(const NeuronGene &g,
     if (g.type == 3) {
         state.prinz = initial_prinz_cell();
         state.voltage_mv = state.prinz.v;
+    }
+    if (g.type == 6) {
+        state.lfs = {};
+        state.lfs.voltage_mv = g.rest_mv;
+        state.lfs.threshold_mv = g.threshold_mv;
     }
     return state;
 }
@@ -228,6 +251,40 @@ NS_HD inline void homeostatic_advance(const NeuronGene &g, NeuronState &s,
         change_per_48h * (elapsed_ms / 172800000.0f), -3.0f, 3.0f);
 }
 
+// Partial port of the experimentally fitted LFS integrate-and-fire cell in
+// Lieb and Frost (1997). Each step is one millisecond. Conductance weights
+// from their Table 2 are converted from microSiemens to nanoSiemens.
+NS_HD inline void lfs_advance(const NeuronGene &g, NeuronState &s,
+                              float current_pa, float excitation_ns,
+                              float inhibition_ns) {
+    constexpr float weight_ns[3] = {250.0f, 10.0f, 4.0f};
+    constexpr float open_ms[3] = {10.0f, 40.0f, 750.0f};
+    constexpr float close_ms[3] = {50.0f, 750.0f, 2000.0f};
+    LFSCell &cell = s.lfs;
+    cell.threshold_mv = g.threshold_mv +
+        (cell.threshold_mv - g.threshold_mv) * expf(-1.0f / 10.0f);
+    float undershoot_ns = 0;
+    for (int j = 0; j < 3; ++j) {
+        cell.open[j] += cell.activated[j] / open_ms[j] -
+                        cell.open[j] / close_ms[j];
+        cell.activated[j] *= expf(-1.0f / open_ms[j]);
+        undershoot_ns += weight_ns[j] * cell.open[j];
+    }
+    float voltage = cell.voltage_mv;
+    float current = g.leak_ns * (g.rest_mv - voltage) +
+        excitation_ns * (10.0f - voltage) +
+        inhibition_ns * (-60.0f - voltage) +
+        undershoot_ns * (-80.0f - voltage) + current_pa;
+    cell.voltage_mv = voltage + current / g.capacitance_pf;
+    s.spike = cell.voltage_mv >= cell.threshold_mv;
+    if (s.spike) {
+        cell.threshold_mv = 200.0f;
+        for (int j = 0; j < 3; ++j) cell.activated[j] += 1.0f;
+        ++s.total_spikes;
+    }
+    s.voltage_mv = cell.voltage_mv;
+}
+
 // AdEx equations with conductance inputs. Physical units: ms, mV, pA, pF, nS.
 NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
                                  float current_pa, const float *incoming_exc_ns,
@@ -242,6 +299,16 @@ NS_HD inline void neuron_advance(const NeuronGene &g, NeuronState &s,
     s.recent_depol_mv += 0.1f * (subthreshold - s.recent_depol_mv);
     s.inh_ns += incoming_inh_ns;
     s.spike = 0;
+    if (g.type == 6) {
+        float excitation = 0;
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            excitation += s.dendrite_exc_ns[branch];
+        lfs_advance(g, s, current_pa, excitation, s.inh_ns);
+        for (int branch = 0; branch < DENDRITES; ++branch)
+            s.dendrite_exc_ns[branch] *= expf(-DT_MS / EXC_DECAY_MS);
+        s.inh_ns *= expf(-DT_MS / INH_DECAY_MS);
+        return;
+    }
     if (g.type == 2) {
         float old_axon = s.lp.x[0];
         float excitation = 0;
