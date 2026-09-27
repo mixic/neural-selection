@@ -7,6 +7,7 @@ const wrap = $('map-wrap');
 const foodLayer = document.createElement('canvas');
 const foodCtx = foodLayer.getContext('2d');
 const colors = ['#000000', '#64b788', '#e5a577', '#78a8d8'];
+const capacities = {animal: 32768, neuron: 4194304, synapse: 8388608};
 let state = null;
 let selectedId = null;
 let lastKnown = null;
@@ -219,6 +220,17 @@ function updateUI(data) {
     ? `STEP ${fmt(data.step)} / ${fmt(data.total)}`
     : `STEP ${fmt(data.step)} · NO LIMIT`;
   $('population').textContent = fmt(data.population);
+  const usage = {
+    animal: data.population,
+    neuron: data.animals.reduce((total, animal) => total + animal[8], 0),
+    synapse: data.animals.reduce((total, animal) => total + animal[9], 0)
+  };
+  for (const [name, limit] of Object.entries(capacities)) {
+    const fraction = usage[name] / limit;
+    $(`${name}-capacity`).textContent = `${fmt(usage[name])} / ${fmt(limit)}`;
+    $(`${name}-capacity-bar`).style.width = `${Math.min(100, fraction * 100)}%`;
+    $(`${name}-capacity-percent`).textContent = `${(fraction * 100).toFixed(1)}% used`;
+  }
   for (const [id, field] of [['births','births'], ['deaths','deaths'],
     ['predation','predation'], ['bites','bites'], ['food-cells','food_cells'],
     ['generation','max_generation']]) $(id).textContent = fmt(data[field]);

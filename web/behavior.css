@@ -10,3 +10,12 @@
 .choice-row small{color:var(--muted);font-size:10px}
 .empty-choice{font-family:'Space Grotesk',sans-serif;font-size:11px;color:var(--mint);margin-top:20px}
 .choice-note{border-top:1px solid var(--line);margin-top:20px;padding-top:14px}
+.capacity p{color:var(--muted);font-size:11px;line-height:1.5;margin:12px 0 18px}
+.capacity-row{margin-top:15px}
+.capacity-row>div:first-child{display:flex;justify-content:space-between;gap:10px;font-size:12px}
+.capacity-row strong{font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:600}
+.capacity-track{height:8px;border-radius:8px;background:#293b39;overflow:hidden;margin:7px 0 4px}
+.capacity-track i{display:block;height:100%;width:0;background:var(--lime);border-radius:8px;transition:width .25s}
+.capacity-row:nth-of-type(2) .capacity-track i{background:var(--mint)}
+.capacity-row:nth-of-type(3) .capacity-track i{background:var(--blue)}
+.capacity-row small{color:var(--muted);font-size:10px}
