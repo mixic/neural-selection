@@ -41,6 +41,7 @@ struct NeuronGene {
     signed char sensory_channel = -1;
     float receptor_baseline_hz = 0, receptor_gain_hz = 0;
     float receptor_event_ns = 0, receptor_decay_ms = 3;
+    float target_affinity = 1;
 };
 struct LFSCell {
     float voltage_mv, threshold_mv;

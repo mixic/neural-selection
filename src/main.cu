@@ -25,7 +25,7 @@ constexpr int P = 2048;
 constexpr int NEURON_CAPACITY = 262144;
 constexpr int SYNAPSE_CAPACITY = 524288;
 constexpr int INITIAL_HIDDEN = 48;
-constexpr int INITIAL_SYNAPSES = 120;
+constexpr int INITIAL_SYNAPSES = 180;
 constexpr int LIFE_RECORD_CAPACITY = P * 16;
 constexpr int LIFE_SAMPLE_INTERVAL = 10;
 constexpr int S = 16;
@@ -40,6 +40,10 @@ constexpr float NEURON_UPKEEP = 0.00002f;
 constexpr float BITE_DAMAGE = 2.0f;
 constexpr float BITE_ENERGY_COST = 0.02f;
 constexpr float MEAT_ENERGY_FRACTION = 0.45f;
+// Approximate the ~200 ms contraction decay measured in stimulated insect
+// muscle. This is body mechanics, not a somatic neural current.
+constexpr float MUSCLE_DECAY_PER_STEP = 0.92311635f; // exp(-16 / 200)
+constexpr float MUSCLE_TWITCH_PER_SPIKE = 0.30f;
 constexpr float PI = 3.14159265358979323846f;
 
 // Observer-only counters. They never enter sensory input or neural updates.
@@ -56,6 +60,7 @@ struct Behavior {
 struct Animal {
     float x, y, heading, energy, health, fullness, pain;
     float taste[4];
+    float muscle[M];
     unsigned long long rng;
     int id, parent_id, generation, age, alive;
     int neuron_head, synapse_head, neuron_count, synapse_count;
@@ -71,6 +76,8 @@ struct LifeRecord {
 struct Device {
     int initial_count;
     int trace_animal;
+    bool silence_senses;
+    bool instant_motors;
     Animal *animals;
     NeuronGene *neurons;
     SynapseGene *synapses;
@@ -232,12 +239,31 @@ __global__ void init_world(Device d, unsigned long long seed) {
 __device__ void random_synapse(SynapseGene &g, Device d, int animal,
                                unsigned long long &rng) {
     Animal body = d.animals[animal];
-    g.pre = neuron_at(d, body, randint(rng, body.neuron_count));
+    int active_sources = 0;
+    float target_weight = 0;
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n]) {
+        NeuronGene gene = d.neurons[n];
+        if (!gene.active) continue;
+        ++active_sources;
+        int port = d.neuron_port[n];
+        if (port < 0 || port >= S) target_weight += gene.target_affinity;
+    }
+    g.pre = body.ports[0];
+    int source_choice = randint(rng, active_sources);
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n])
+        if (d.neurons[n].active && source_choice-- == 0) {
+            g.pre = n;
+            break;
+        }
     g.post = body.ports[S + randint(rng, M)];
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        int target = neuron_at(d, body, randint(rng, body.neuron_count));
-        if (d.neuron_port[target] >= S || d.neuron_port[target] < 0) {
-            g.post = target;
+    float target_choice = uniform(rng) * target_weight;
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n]) {
+        NeuronGene gene = d.neurons[n];
+        int port = d.neuron_port[n];
+        if (!gene.active || (port >= 0 && port < S)) continue;
+        target_choice -= gene.target_affinity;
+        if (target_choice <= 0) {
+            g.post = n;
             break;
         }
     }
@@ -301,11 +327,25 @@ __global__ void init_animals(Device d, int initial, unsigned long long seed) {
         }
         int port = local < S + M ? local : -1;
         float cell_draw = uniform(rng);
-        unsigned char type = port >= 0 && port < 6 ? 5 :
-            (port >= 0 ? 0 :
-             (cell_draw < 0.40f ? 0 : (cell_draw < 0.75f ? 1 :
-              (cell_draw < 0.77f ? 2 : (cell_draw < 0.79f ? 3 : 5)))));
+        unsigned char type;
+        if (port >= 0 && port < 6) type = 5;
+        else if (port >= 0 && port < S) type = 0;
+        else if (port >= S)
+            type = cell_draw < 0.45f ? 0 :
+                   (cell_draw < 0.55f ? 1 :
+                    (cell_draw < 0.80f ? 4 : 6));
+        else
+            type = cell_draw < 0.35f ? 0 :
+                   (cell_draw < 0.65f ? 1 :
+                    (cell_draw < 0.67f ? 2 :
+                     (cell_draw < 0.69f ? 3 :
+                      (cell_draw < 0.80f ? 4 : 5))));
         NeuronGene g = initial_profile(type);
+        if (port < 0 || port >= S) {
+            float affinity_draw = uniform(rng);
+            g.target_affinity = affinity_draw < 0.015f ? 100.0f :
+                (affinity_draw < 0.075f ? 20.0f : 1.0f);
+        }
         if (type == 5) g.sensory_channel =
             (signed char)(port >= 0 ? port : randint(rng, 6));
         else if (port >= 0 && port < S) g.sensory_channel =
@@ -450,7 +490,8 @@ __global__ void neuron_step(Device d, int64_t tick) {
     int port = d.neuron_port[i];
     float sensory = 0.0f;
     if (g.sensory_channel >= 0 && g.sensory_channel < S) {
-        float level = d.senses[a * S + g.sensory_channel];
+        float level = d.silence_senses ? 0.0f :
+            d.senses[a * S + g.sensory_channel];
         sensory = g.type == 5 && g.sensory_channel < 6
             ? receptor_current(g, state, level) : level * 230.0f;
     }
@@ -509,11 +550,19 @@ __global__ void body_step(Device d) {
     const int age_bin = b.age < 100 ? 0 : (b.age < 300 ? 1 : 2);
     const bool hungry = b.energy < 16.0f;
     const float old_x = b.x, old_y = b.y;
-    float thrust = d.motors[a * M + 0] / (float)TICKS;
-    float left = d.motors[a * M + 1] / (float)TICKS;
-    float right = d.motors[a * M + 2] / (float)TICKS;
-    bool eat = d.motors[a * M + 3] > 0;
-    d.bite_intent[a] = d.motors[a * M + 4] > 0;
+    float motor_force[M];
+    for (int m = 0; m < M; ++m) {
+        motor_force[m] = d.instant_motors
+            ? d.motors[a * M + m] / (float)TICKS
+            : (b.muscle[m] = fminf(1.0f,
+                  b.muscle[m] * MUSCLE_DECAY_PER_STEP +
+                  d.motors[a * M + m] * MUSCLE_TWITCH_PER_SPIKE));
+    }
+    float thrust = motor_force[0];
+    float left = motor_force[1];
+    float right = motor_force[2];
+    bool eat = d.instant_motors ? d.motors[a * M + 3] > 0 : motor_force[3] > 0.05f;
+    d.bite_intent[a] = d.instant_motors ? d.motors[a * M + 4] > 0 : motor_force[4] > 0.05f;
     if (b.id < d.initial_count && b.age < 100) {
         atomicAdd(d.founder_observed_steps, 1);
         for (int m = 0; m < M; ++m)
@@ -746,7 +795,7 @@ __device__ int random_hidden_afferent(Device d, const Animal &body,
 __device__ void mutate(Device d, int child, unsigned long long &rng) {
     int mutations = 1 + randint(rng, 4);
     for (int m = 0; m < mutations; ++m) {
-        int choice = randint(rng, 11);
+        int choice = randint(rng, 12);
         Animal body = d.animals[child];
         int n = random_hidden_neuron(d, body, rng);
         int e = body.synapse_count ?
@@ -775,7 +824,7 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                             break;
                         }
                     }
-                    unsigned char type = (unsigned char)randint(rng, 5);
+                    unsigned char type = (unsigned char)randint(rng, 7);
                     NeuronGene g = initial_profile(type);
                     g.modulator = uniform(rng) < 0.12f ?
                         (unsigned char)(1 + randint(rng, 3)) : 0;
@@ -809,13 +858,15 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             } else if (n >= 0) d.neurons[n].active ^= 1;
         } else if (choice == 1 && n >= 0) {
             auto active = d.neurons[n].active;
-            unsigned char type = (unsigned char)randint(rng, 5);
+            unsigned char type = (unsigned char)randint(rng, 7);
             unsigned char modulator = d.neurons[n].modulator;
             unsigned char inhibitory_transmitter = d.neurons[n].inhibitory_transmitter;
+            float target_affinity = d.neurons[n].target_affinity;
             d.neurons[n] = initial_profile(type);
             d.neurons[n].active = active;
             d.neurons[n].modulator = modulator;
             d.neurons[n].inhibitory_transmitter = inhibitory_transmitter;
+            d.neurons[n].target_affinity = target_affinity;
         } else if (choice == 2) {
             // Motor ports stay fixed, but their intrinsic excitability can evolve.
             int target = uniform(rng) < 0.2f
@@ -971,6 +1022,8 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 auto &g = d.neurons[afferent];
                 int channel = randint(rng, S);
                 unsigned char active = g.active;
+                unsigned char inhibitory_transmitter = g.inhibitory_transmitter;
+                float target_affinity = g.target_affinity;
                 if (g.type == 5 && channel >= 6) {
                     g = cortical_l5_profile();
                 } else if (g.type != 5 && channel < 6) {
@@ -978,6 +1031,16 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 }
                 g.sensory_channel = (signed char)channel;
                 g.active = active;
+                g.inhibitory_transmitter = inhibitory_transmitter;
+                g.target_affinity = target_affinity;
+            }
+        } else if (choice == 11) {
+            int target = uniform(rng) < 0.3f
+                ? body.ports[S + randint(rng, M)] : n;
+            if (target >= 0) {
+                auto &g = d.neurons[target];
+                g.target_affinity = clamp(g.target_affinity *
+                    (uniform(rng) < 0.5f ? 0.5f : 2.0f), 0.125f, 256.0f);
             }
         }
     }
@@ -1120,7 +1183,7 @@ void write_brains(const std::string &prefix, Device d) {
     download(neuron_port, d.neuron_port, NEURON_CAPACITY);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,port,active,type,modulator,inhibitory_transmitter,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
+    cells << "animal_id,generation,neuron,port,active,type,modulator,inhibitory_transmitter,target_affinity,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
     edges << "animal_id,generation,synapse,active,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors,slow_recovery_ms,slow_depletion\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = animals[a].neuron_head, visited = 0;
@@ -1131,6 +1194,7 @@ void write_brains(const std::string &prefix, Device d) {
                 << neuron_port[n] << ',' << (int)g.active << ','
                 << (int)g.type << ',' << (int)g.modulator << ','
                 << (int)g.inhibitory_transmitter << ','
+                << g.target_affinity << ','
                 << g.capacitance_pf << ',' << g.leak_ns << ','
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
@@ -1251,7 +1315,8 @@ int main(int argc, char **argv) {
     int initial = 1024;
     int live_port = 8765;
     int trace_animal = -1;
-    bool visualize = false, steps_specified = false;
+    bool visualize = false, steps_specified = false, silence_senses = false,
+         instant_motors = false;
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
     std::string output = "run.csv";
@@ -1269,7 +1334,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) live_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace-animal") && i + 1 < argc)
             trace_animal = atoi(argv[++i]);
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot]\n"; return 2; }
+        else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
+        else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--instant-motors]\n"; return 2; }
     }
     if (visualize && !steps_specified) steps = 0;
     if (steps < 0 || steps > INT64_MAX / TICKS ||
@@ -1294,6 +1361,8 @@ int main(int argc, char **argv) {
     Device d{};
     d.initial_count = initial;
     d.trace_animal = trace_animal;
+    d.silence_senses = silence_senses;
+    d.instant_motors = instant_motors;
     allocate(d.animals, P);
     allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);
     allocate(d.neuron_state, NEURON_CAPACITY);

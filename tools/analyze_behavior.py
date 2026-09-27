@@ -112,8 +112,8 @@ def main():
           "survival selection can all affect the rates; they do not by themselves prove learning.")
     print("C has no distant sensory channel, so its approach score is a reference, "
           "not evidence that animals can see C.")
-    print("The eat motor starts with a strong bias; a high eating rate on both "
-          "stocked and empty cells is not selective feeding.")
+    print("A high eating rate on both stocked and empty cells is not selective "
+          "feeding. The current genomes have no inherited constant-current bias.")
 
 
 if __name__ == "__main__":
