@@ -31,6 +31,8 @@ struct NeuronGene {
     float adapt_ns, adapt_tau_ms, spike_adapt_pa, reset_mv;
     float afterdepol_spike_pa, afterdepol_tau_ms;
     unsigned char type, active, modulator;
+    // Fast transmitter identity is independent of membrane dynamics.
+    unsigned char inhibitory_transmitter = 0;
     LPConductance lp_scale;
     PrinzConductance prinz_g;
     float prinz_ambient_leak_ns;
@@ -73,7 +75,11 @@ NS_HD inline float bound(float x, float low, float high) {
 }
 
 NS_HD inline NeuronGene recorded_profile(unsigned char type) {
-    if (type == 1) return {59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 1, 1, 0};
+    if (type == 1) {
+        NeuronGene g{59, 2.9f, -62, -42, 3.0f, 1.8f, 16, 61, -54, 0, 0, 1, 1, 0};
+        g.inhibitory_transmitter = 1;
+        return g;
+    }
     return {104, 4.3f, -65, -52, 0.8f, -0.8f, 88, 65, -53, 0, 0, 0, 1, 0};
 }
 

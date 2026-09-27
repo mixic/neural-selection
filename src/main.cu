@@ -400,7 +400,7 @@ __global__ void synapse_delivery(Device d, int64_t tick) {
         d.spike_history[((tick - g.delay) % HISTORY) * NEURON_CAPACITY + g.pre];
     if (state.arrived) {
         NeuronGene source = d.neurons[g.pre];
-        float released = excitatory_type(source.type) || source.modulator
+        float released = !source.inhibitory_transmitter || source.modulator
             ? synapse_release(g, state, tick) : state.weight_ns;
         int motor = d.neuron_port[g.post] - S;
         bool traced_motor = a == d.trace_animal && motor >= 0 && motor < M;
@@ -408,7 +408,7 @@ __global__ void synapse_delivery(Device d, int64_t tick) {
             if (released > 0)
                 atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1],
                           static_cast<unsigned long long>(tick + 1));
-        } else if (excitatory_type(source.type)) {
+        } else if (!source.inhibitory_transmitter) {
             if (traced_motor) {
                 atomicAdd(&d.trace_exc_arrivals[motor], 1);
                 if (released > 0) atomicAdd(&d.trace_exc_releases[motor], 1);
@@ -475,8 +475,10 @@ __global__ void synapse_plasticity(Device d, int64_t tick) {
         d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
         !d.neurons[g.post].active) return;
     SynapseState s = d.synapse_state[i];
-    bool excitatory_pair = excitatory_type(d.neurons[g.pre].type) &&
+    bool excitatory_pair = !d.neurons[g.pre].inhibitory_transmitter &&
+        excitatory_type(d.neurons[g.pre].type) &&
         d.neurons[g.pre].modulator == 0 &&
+        !d.neurons[g.post].inhibitory_transmitter &&
         excitatory_type(d.neurons[g.post].type);
     int target = g.post * 3;
     unsigned char mod_event = 0;
@@ -657,8 +659,10 @@ __global__ void reclaim_dead_genomes(Device d, int64_t step) {
                           d.neurons[g.post].active;
             record.active_synapses += active;
             record.plastic_synapses += active && g.plasticity != 0 &&
+                !d.neurons[g.pre].inhibitory_transmitter &&
                 excitatory_type(d.neurons[g.pre].type) &&
                 d.neurons[g.pre].modulator == 0 &&
+                !d.neurons[g.post].inhibitory_transmitter &&
                 excitatory_type(d.neurons[g.post].type);
             if (active) total_weight_change +=
                 fabsf(d.synapse_state[e].weight_ns - g.initial_weight_ns);
@@ -807,9 +811,11 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
             auto active = d.neurons[n].active;
             unsigned char type = (unsigned char)randint(rng, 5);
             unsigned char modulator = d.neurons[n].modulator;
+            unsigned char inhibitory_transmitter = d.neurons[n].inhibitory_transmitter;
             d.neurons[n] = initial_profile(type);
             d.neurons[n].active = active;
             d.neurons[n].modulator = modulator;
+            d.neurons[n].inhibitory_transmitter = inhibitory_transmitter;
         } else if (choice == 2) {
             // Motor ports stay fixed, but their intrinsic excitability can evolve.
             int target = uniform(rng) < 0.2f
@@ -902,8 +908,11 @@ __device__ void mutate(Device d, int child, unsigned long long &rng) {
                 g.afterdepol_tau_ms = clamp(g.afterdepol_tau_ms +
                     (uniform(rng) - 0.5f) * 10, 10, 150);
             }
-        } else if (choice == 9 && n >= 0 && d.neurons[n].type != 5) {
-            d.neurons[n].modulator = (unsigned char)randint(rng, 4);
+        } else if (choice == 9 && n >= 0) {
+            if (d.neurons[n].type != 5 && uniform(rng) < 0.5f)
+                d.neurons[n].modulator = (unsigned char)randint(rng, 4);
+            else
+                d.neurons[n].inhibitory_transmitter ^= 1;
         } else if (choice == 10) {
             float action = uniform(rng);
             int afferent = random_hidden_afferent(d, body, rng);
@@ -1111,7 +1120,7 @@ void write_brains(const std::string &prefix, Device d) {
     download(neuron_port, d.neuron_port, NEURON_CAPACITY);
     std::ofstream cells(prefix + ".neurons.csv");
     std::ofstream edges(prefix + ".synapses.csv");
-    cells << "animal_id,generation,neuron,port,active,type,modulator,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
+    cells << "animal_id,generation,neuron,port,active,type,modulator,inhibitory_transmitter,capacitance_pf,leak_ns,rest_mv,threshold_mv,slope_mv,adapt_ns,adapt_tau_ms,spike_adapt_pa,reset_mv,afterdepol_spike_pa,afterdepol_tau_ms,ampa_scale,lp_calcium_scale,lp_kca_scale,lp_h_scale,lp_leak_scale,prinz_na_ns,prinz_cat_ns,prinz_cas_ns,prinz_a_ns,prinz_kca_ns,prinz_kd_ns,prinz_h_ns,prinz_leak_ns,prinz_ambient_leak_ns,sensory_channel,receptor_baseline_hz,receptor_gain_hz,receptor_event_ns,receptor_decay_ms,receptor_state_ns,total_spikes\n";
     edges << "animal_id,generation,synapse,active,pre,post,branch,delay_ms,initial_weight_ns,learned_weight_ns,spine_volume,utilization,recovery_ms,facilitation_ms,release_sites,plasticity,mod_receptors,slow_recovery_ms,slow_depletion\n";
     for (int a = 0; a < P; ++a) if (animals[a].alive == 1) {
         for (int n = animals[a].neuron_head, visited = 0;
@@ -1121,6 +1130,7 @@ void write_brains(const std::string &prefix, Device d) {
             cells << animals[a].id << ',' << animals[a].generation << ',' << n << ','
                 << neuron_port[n] << ',' << (int)g.active << ','
                 << (int)g.type << ',' << (int)g.modulator << ','
+                << (int)g.inhibitory_transmitter << ','
                 << g.capacitance_pf << ',' << g.leak_ns << ','
                 << g.rest_mv << ',' << g.threshold_mv << ',' << g.slope_mv << ','
                 << g.adapt_ns << ',' << g.adapt_tau_ms << ',' << g.spike_adapt_pa << ','
