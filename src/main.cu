@@ -76,6 +76,11 @@ struct LifeRecord {
     int active_neurons, active_synapses, modulatory_neurons, plastic_synapses;
     float mean_abs_weight_change;
 };
+struct BiteEvent {
+    int64_t step;
+    int attacker_id, prey_id;
+    float x, y;
+};
 struct Device {
     int initial_count;
     int trace_animal;
@@ -104,6 +109,8 @@ struct Device {
     int *births, *deaths, *predation_deaths, *bites, *next_id;
     LifeRecord *life_records;
     int *life_count;
+    BiteEvent *bite_events;
+    int *bite_event_count;
 };
 
 struct OwnedSlot {
@@ -670,7 +677,7 @@ __global__ void body_step(Device d) {
     d.animals[a] = b;
 }
 
-__global__ void bite_animals(Device d) {
+__global__ void bite_animals(Device d, int64_t step) {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= P || d.animals[a].alive != 1 || !d.bite_intent[a]) return;
     int c = cell(d.animals[a].x, d.animals[a].y);
@@ -679,6 +686,13 @@ __global__ void bite_animals(Device d) {
         float previous_health = atomicAdd(&d.animals[prey].health, -BITE_DAMAGE);
         atomicAdd(&d.animals[prey].pain, BITE_DAMAGE);
         atomicAdd(d.bites, 1);
+        if (d.bite_events) {
+            int event = atomicAdd(d.bite_event_count, 1);
+            if (event < 2 * P)
+                d.bite_events[event] = {step, d.animals[a].id,
+                                        d.animals[prey].id,
+                                        d.animals[prey].x, d.animals[prey].y};
+        }
         if (previous_health <= BITE_DAMAGE &&
             atomicCAS(&d.animals[prey].alive, 1, -2) == 1) {
             atomicAdd(&d.animals[a].energy,
@@ -1429,6 +1443,11 @@ int main(int argc, char **argv) {
     allocate(d.next_id, 1);
     allocate(d.life_records, LIFE_RECORD_CAPACITY);
     allocate(d.life_count, 1);
+    if (live) {
+        allocate(d.bite_events, 2 * P);
+        allocate(d.bite_event_count, 1);
+        check(cudaMemset(d.bite_event_count, 0, sizeof(int)), "bite event reset");
+    }
     auto slots = thrust::make_counting_iterator<int>(0);
     size_t neuron_select_bytes = 0, synapse_select_bytes = 0;
     check(cub::DeviceSelect::If(nullptr, neuron_select_bytes, slots,
@@ -1490,6 +1509,9 @@ int main(int argc, char **argv) {
     std::deque<std::pair<int64_t, BehaviorTotals>> behavior_history;
     std::vector<Animal> bodies;
     std::vector<LifeRecord> recent_lives;
+    std::vector<BiteEvent> recent_bites;
+    std::deque<std::pair<uint64_t, BiteEvent>> bite_history;
+    uint64_t next_bite_event_id = 1;
     std::vector<int> active_neurons, active_synapses;
     std::vector<int> food, kind;
     std::vector<uint32_t> neuron_used, synapse_used;
@@ -1586,6 +1608,23 @@ int main(int argc, char **argv) {
                       << "  food " << food_cells << "  max generation " << max_generation << '\n';
         }
         if (live) {
+            int event_count = 0;
+            check(cudaMemcpy(&event_count, d.bite_event_count, sizeof(int),
+                             cudaMemcpyDeviceToHost), "bite event count");
+            if (event_count > 2 * P) {
+                std::cerr << "Bite event buffer overflow at step " << step << '\n';
+                std::exit(1);
+            }
+            if (event_count > 0) {
+                download(recent_bites, d.bite_events, event_count);
+                for (const BiteEvent &event : recent_bites)
+                    bite_history.emplace_back(next_bite_event_id++, event);
+            }
+            check(cudaMemset(d.bite_event_count, 0, sizeof(int)), "bite event reset");
+            while (!bite_history.empty() &&
+                   (bite_history.front().second.step < step - 80 ||
+                    bite_history.size() > 1024))
+                bite_history.pop_front();
             std::ostringstream json;
             json.setf(std::ios::fixed);
             json.precision(2);
@@ -1629,7 +1668,16 @@ int main(int argc, char **argv) {
                 }
             }
             json << "],\"empty_choice\":[" << empty_eat << ',' << empty_steps
-                 << "],\"animals\":[";
+                 << "],\"bite_events\":[";
+            bool first_bite = true;
+            for (const auto &[id, event] : bite_history) {
+                if (!first_bite) json << ',';
+                first_bite = false;
+                json << '[' << id << ',' << event.step << ','
+                     << event.attacker_id << ',' << event.prey_id << ','
+                     << event.x << ',' << event.y << ']';
+            }
+            json << "],\"animals\":[";
             bool first = true;
             for (int a = 0; a < P; ++a) if (bodies[a].alive == 1) {
                 const Animal &b = bodies[a];
@@ -1686,7 +1734,7 @@ int main(int argc, char **argv) {
         body_step<<<(P + 127) / 128, 128>>>(d);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
-        bite_animals<<<(P + 127) / 128, 128>>>(d);
+        bite_animals<<<(P + 127) / 128, 128>>>(d, step);
         finish_predation<<<(P + 127) / 128, 128>>>(d);
         if (neuron_count)
             homeostasis_step<<<(neuron_count + 255) / 256, 256>>>(d, neuron_count);
@@ -1769,4 +1817,5 @@ int main(int argc, char **argv) {
     cudaFree(d.births); cudaFree(d.deaths); cudaFree(d.predation_deaths);
     cudaFree(d.bites); cudaFree(d.next_id);
     cudaFree(d.life_records); cudaFree(d.life_count);
+    if (live) { cudaFree(d.bite_events); cudaFree(d.bite_event_count); }
 }

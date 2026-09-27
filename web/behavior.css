@@ -19,3 +19,5 @@
 .capacity-row:nth-of-type(2) .capacity-track i{background:var(--mint)}
 .capacity-row:nth-of-type(3) .capacity-track i{background:var(--blue)}
 .capacity-row small{color:var(--muted);font-size:10px}
+.legend-dot.bite{background:#ffb45e;box-shadow:0 0 8px #ffb45e}
+.legend [hidden]{display:none}

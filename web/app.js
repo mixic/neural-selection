@@ -12,6 +12,7 @@ let state = null;
 let selectedId = null;
 let lastKnown = null;
 let events = [];
+let lastBiteEventId = 0;
 let history = [];
 let zoom = 1;
 let panX = 0;
@@ -132,12 +133,21 @@ function drawWorld(now) {
     const x = t.x + event.x * t.scale, y = t.y + event.y * t.scale;
     if (x < -20 || y < -20 || x > width + 20 || y > height + 20) continue;
     ctx.globalAlpha = 1 - age;
-    ctx.strokeStyle = event.type === 'birth' ? '#8dcfc4' : '#ef847c';
+    ctx.strokeStyle = event.type === 'birth' ? '#8dcfc4'
+      : event.type === 'bite' ? '#ffb45e' : '#ef847c';
     ctx.lineWidth = 1.5;
     if (event.type === 'birth') {
       ctx.beginPath();
       ctx.arc(x, y, 4 + age * 14, 0, Math.PI * 2);
       ctx.stroke();
+    } else if (event.type === 'bite') {
+      ctx.beginPath();
+      ctx.arc(x, y, 5 + age * 13, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#ffb45e';
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(1, 3 - age * 2), 0, Math.PI * 2);
+      ctx.fill();
     } else {
       const r = 3 + age * 6;
       ctx.beginPath();
@@ -213,6 +223,7 @@ function updateInspector() {
 }
 
 function updateUI(data) {
+  $('bite-legend').hidden = !Array.isArray(data.bite_events);
   const status = data.finished ? 'RUN COMPLETE' : data.paused ? 'PAUSED' : 'LIVE';
   $('status').textContent = status;
   $('status-dot').className = 'status-dot ' + (data.finished ? 'finished' : data.paused ? 'paused' : '');
@@ -259,6 +270,19 @@ async function poll() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (!Number.isFinite(data.step)) { setTimeout(poll, 150); return; }
+    if (state && (data.step < state.step || data.bites < state.bites)) {
+      lastBiteEventId = 0;
+      events = [];
+      history = [];
+    }
+    const biteEvents = data.bite_events || [];
+    if (state) {
+      const now = performance.now();
+      for (const bite of biteEvents) if (bite[0] > lastBiteEventId)
+        events.push({type: 'bite', x: bite[4], y: bite[5], time: now});
+    }
+    if (biteEvents.length)
+      lastBiteEventId = Math.max(lastBiteEventId, ...biteEvents.map(bite => bite[0]));
     if (data.step !== state?.step) {
       if (state) {
         const old = new Map(state.animals.map(a => [a[0], a]));
