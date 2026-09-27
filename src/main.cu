@@ -28,8 +28,9 @@ constexpr int INITIAL_HIDDEN = 48;
 constexpr int INITIAL_SYNAPSES = 180;
 constexpr int LIFE_RECORD_CAPACITY = P * 16;
 constexpr int LIFE_SAMPLE_INTERVAL = 10;
-constexpr int S = 16;
+constexpr int S = 19;
 constexpr int M = 5;
+constexpr int CONTACT_FOOD_START = 16;
 constexpr int W = 128;
 constexpr int H = 128;
 constexpr int D = 8;
@@ -60,7 +61,7 @@ struct Behavior {
 struct Animal {
     float x, y, heading, energy, health, fullness, pain;
     float taste[4];
-    float muscle[M];
+    float muscle[3];
     unsigned long long rng;
     int id, parent_id, generation, age, alive;
     int neuron_head, synapse_head, neuron_count, synapse_count;
@@ -77,6 +78,7 @@ struct Device {
     int initial_count;
     int trace_animal;
     bool silence_senses;
+    bool silence_contact;
     bool instant_motors;
     Animal *animals;
     NeuronGene *neurons;
@@ -423,6 +425,12 @@ __global__ void update_senses(Device d) {
         d.senses[a * S + 12 + direction] = clamp(level, 0, 1);
     }
     d.senses[a * S + 15] = clamp(b.taste[3], 0, 1);
+    // Contact chemoreceptors report identity, without an assigned food value.
+    // They update after body_step and can inform the next neural decision.
+    int contact_cell = cell(b.x, b.y);
+    for (int kind = 0; kind < 3; ++kind)
+        d.senses[a * S + CONTACT_FOOD_START + kind] =
+            d.food[contact_cell] > 0 && d.kind[contact_cell] == kind ? 1.0f : 0.0f;
 }
 
 __global__ void synapse_delivery(Device d, int64_t tick) {
@@ -490,7 +498,9 @@ __global__ void neuron_step(Device d, int64_t tick) {
     int port = d.neuron_port[i];
     float sensory = 0.0f;
     if (g.sensory_channel >= 0 && g.sensory_channel < S) {
-        float level = d.silence_senses ? 0.0f :
+        float level = (d.silence_senses ||
+                       (d.silence_contact && g.sensory_channel >= CONTACT_FOOD_START))
+            ? 0.0f :
             d.senses[a * S + g.sensory_channel];
         sensory = g.type == 5 && g.sensory_channel < 6
             ? receptor_current(g, state, level) : level * 230.0f;
@@ -551,7 +561,7 @@ __global__ void body_step(Device d) {
     const bool hungry = b.energy < 16.0f;
     const float old_x = b.x, old_y = b.y;
     float motor_force[M];
-    for (int m = 0; m < M; ++m) {
+    for (int m = 0; m < 3; ++m) {
         motor_force[m] = d.instant_motors
             ? d.motors[a * M + m] / (float)TICKS
             : (b.muscle[m] = fminf(1.0f,
@@ -561,8 +571,10 @@ __global__ void body_step(Device d) {
     float thrust = motor_force[0];
     float left = motor_force[1];
     float right = motor_force[2];
-    bool eat = d.instant_motors ? d.motors[a * M + 3] > 0 : motor_force[3] > 0.05f;
-    d.bite_intent[a] = d.instant_motors ? d.motors[a * M + 4] > 0 : motor_force[4] > 0.05f;
+    // The measured slow body-muscle twitch is not assumed for the feeding
+    // apparatus or biting; those actions need a current motor spike.
+    bool eat = d.motors[a * M + 3] > 0;
+    d.bite_intent[a] = d.motors[a * M + 4] > 0;
     if (b.id < d.initial_count && b.age < 100) {
         atomicAdd(d.founder_observed_steps, 1);
         for (int m = 0; m < M; ++m)
@@ -610,7 +622,9 @@ __global__ void body_step(Device d) {
     b.fullness = fmaxf(0, b.fullness - 0.05f);
     b.pain *= 0.8f;
     for (int k = 0; k < 4; ++k) b.taste[k] *= 0.7f;
-    int food_cell = cell(b.x, b.y);
+    // Feed at the location sensed before this neural decision. Movement may
+    // reach another food cell, whose contact identity is sensed next step.
+    int food_cell = cell(old_x, old_y);
     bool food_offered = atomicAdd(&d.food[food_cell], 0) > 0;
     if (food_offered) {
         int kind = d.kind[food_cell];
@@ -1316,6 +1330,7 @@ int main(int argc, char **argv) {
     int live_port = 8765;
     int trace_animal = -1;
     bool visualize = false, steps_specified = false, silence_senses = false,
+         silence_contact = false,
          instant_motors = false;
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
@@ -1335,8 +1350,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace-animal") && i + 1 < argc)
             trace_animal = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
+        else if (!strcmp(argv[i], "--silence-contact")) silence_contact = true;
         else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--instant-motors]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
     }
     if (visualize && !steps_specified) steps = 0;
     if (steps < 0 || steps > INT64_MAX / TICKS ||
@@ -1362,6 +1378,7 @@ int main(int argc, char **argv) {
     d.initial_count = initial;
     d.trace_animal = trace_animal;
     d.silence_senses = silence_senses;
+    d.silence_contact = silence_contact;
     d.instant_motors = instant_motors;
     allocate(d.animals, P);
     allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);

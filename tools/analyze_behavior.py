@@ -110,8 +110,8 @@ def main():
     lifetime_comparison(lives, last, width)
     print("These are observational associations. Age, experience, genotype, and "
           "survival selection can all affect the rates; they do not by themselves prove learning.")
-    print("C has no distant sensory channel, so its approach score is a reference, "
-          "not evidence that animals can see C.")
+    print("C has no distant sensory channel, so its approach score is a reference. "
+          "Contact cues depend on the run version and diagnostic flags.")
     print("A high eating rate on both stocked and empty cells is not selective "
           "feeding. The current genomes have no inherited constant-current bias.")
 
