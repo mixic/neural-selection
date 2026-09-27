@@ -6,6 +6,7 @@
 #include "live_view.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -17,9 +18,9 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace sim {
@@ -38,6 +39,7 @@ constexpr int H = 128;
 constexpr int D = 8;
 constexpr int HISTORY = D + 1;
 constexpr int TICKS = 16;
+constexpr int NEURAL_BLOCK = 512;
 constexpr float BODY_UPKEEP = 0.003f;
 constexpr float NEURON_UPKEEP = 0.00002f;
 constexpr float BITE_DAMAGE = 2.0f;
@@ -93,6 +95,8 @@ struct Device {
     NeuronState *neuron_state;
     SynapseState *synapse_state;
     float *pending_exc, *pending_inh, *senses;
+    // Alternating tick slots keep the previous modulation event readable
+    // while the fused synapse pass writes the current tick's event.
     unsigned long long *mod_event_tick;
     unsigned char *spike_history;
     int *neuron_owner, *synapse_owner, *neuron_next, *synapse_next;
@@ -116,6 +120,31 @@ struct Device {
 struct OwnedSlot {
     const int *owner;
     __device__ bool operator()(int slot) const { return owner[slot] >= 0; }
+};
+
+struct JsonBuilder {
+    std::string value;
+    explicit JsonBuilder(size_t capacity) { value.reserve(capacity); }
+    JsonBuilder &operator<<(const char *text) { value += text; return *this; }
+    JsonBuilder &operator<<(char character) { value += character; return *this; }
+    template <typename T, std::enable_if_t<std::is_integral_v<T> &&
+                                            !std::is_same_v<T, char>, int> = 0>
+    JsonBuilder &operator<<(T number) {
+        char buffer[32];
+        auto result = std::to_chars(buffer, buffer + sizeof(buffer), number);
+        value.append(buffer, result.ptr);
+        return *this;
+    }
+    JsonBuilder &operator<<(float number) { return append_float(number); }
+    JsonBuilder &operator<<(double number) { return append_float(number); }
+    JsonBuilder &append_float(double number) {
+        char buffer[64];
+        auto result = std::to_chars(buffer, buffer + sizeof(buffer), number,
+                                    std::chars_format::fixed, 2);
+        value.append(buffer, result.ptr);
+        return *this;
+    }
+    std::string str() { return std::move(value); }
 };
 
 __host__ __device__ inline float clamp(float x, float lo, float hi) {
@@ -214,7 +243,7 @@ __device__ void initialize_neuron(Device d, int n, int owner, int port,
     for (int branch = 0; branch < DENDRITES; ++branch)
         d.pending_exc[n * DENDRITES + branch] = 0;
     d.pending_inh[n] = 0;
-    for (int k = 0; k < 3; ++k) d.mod_event_tick[n * 3 + k] = 0;
+    for (int k = 0; k < 6; ++k) d.mod_event_tick[n * 6 + k] = 0;
     for (int delay = 0; delay < HISTORY; ++delay)
         d.spike_history[delay * NEURON_CAPACITY + n] = 0;
 }
@@ -449,18 +478,8 @@ __global__ void update_senses(Device d) {
             d.food[contact_cell] > 0 && d.kind[contact_cell] == kind ? 1.0f : 0.0f;
 }
 
-__global__ void synapse_delivery(Device d, int64_t tick, int occupied_count) {
-    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ordinal >= occupied_count) return;
-    int i = d.occupied_synapses[ordinal];
-    int a = d.synapse_owner[i];
-    if (a < 0) return;
-    if (d.animals[a].alive != 1) return;
-    SynapseGene g = d.synapses[i];
-    if (!g.active || d.neuron_owner[g.pre] != a ||
-        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
-        !d.neurons[g.post].active) return;
-    SynapseState state = d.synapse_state[i];
+__device__ inline void deliver_synapse(Device d, int a, const SynapseGene &g,
+                                       SynapseState &state, int64_t tick) {
     state.arrived = tick >= g.delay &&
         d.spike_history[((tick - g.delay) % HISTORY) * NEURON_CAPACITY + g.pre];
     if (state.arrived) {
@@ -471,7 +490,8 @@ __global__ void synapse_delivery(Device d, int64_t tick, int occupied_count) {
         bool traced_motor = a == d.trace_animal && motor >= 0 && motor < M;
         if (source.modulator) {
             if (released > 0)
-                atomicMax(&d.mod_event_tick[g.post * 3 + source.modulator - 1],
+                atomicMax(&d.mod_event_tick[g.post * 6 +
+                          (source.modulator - 1) * 2 + (tick & 1)],
                           static_cast<unsigned long long>(tick + 1));
         } else if (!source.inhibitory_transmitter) {
             if (traced_motor) {
@@ -492,6 +512,20 @@ __global__ void synapse_delivery(Device d, int64_t tick, int occupied_count) {
             atomicAdd(&d.pending_inh[g.post], released);
         }
     }
+}
+
+__global__ void synapse_delivery(Device d, int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_synapses[ordinal];
+    int a = d.synapse_owner[i];
+    if (a < 0 || d.animals[a].alive != 1) return;
+    SynapseGene g = d.synapses[i];
+    if (!g.active || d.neuron_owner[g.pre] != a ||
+        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
+        !d.neurons[g.post].active) return;
+    SynapseState state = d.synapse_state[i];
+    deliver_synapse(d, a, g, state, tick);
     d.synapse_state[i] = state;
 }
 
@@ -533,34 +567,57 @@ __global__ void neuron_step(Device d, int64_t tick, int occupied_count) {
     d.neuron_state[i] = state;
 }
 
-__global__ void synapse_plasticity(Device d, int64_t tick, int occupied_count) {
-    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ordinal >= occupied_count) return;
-    int i = d.occupied_synapses[ordinal];
-    int a = d.synapse_owner[i];
-    if (a < 0) return;
-    if (d.animals[a].alive != 1) return;
-    SynapseGene g = d.synapses[i];
-    if (!g.active || d.neuron_owner[g.pre] != a ||
-        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
-        !d.neurons[g.post].active) return;
-    SynapseState s = d.synapse_state[i];
+__device__ inline void plasticity_synapse(Device d, const SynapseGene &g,
+                                          SynapseState &s, int64_t tick) {
     bool excitatory_pair = !d.neurons[g.pre].inhibitory_transmitter &&
         excitatory_type(d.neurons[g.pre].type) &&
         d.neurons[g.pre].modulator == 0 &&
         !d.neurons[g.post].inhibitory_transmitter &&
         excitatory_type(d.neurons[g.post].type);
-    int target = g.post * 3;
+    int target = g.post * 6 + (tick & 1);
     unsigned char mod_event = 0;
     if (d.mod_event_tick[target] == static_cast<unsigned long long>(tick + 1))
         mod_event |= MOD_NE;
-    if (d.mod_event_tick[target + 1] == static_cast<unsigned long long>(tick + 1))
-        mod_event |= MOD_5HT;
     if (d.mod_event_tick[target + 2] == static_cast<unsigned long long>(tick + 1))
+        mod_event |= MOD_5HT;
+    if (d.mod_event_tick[target + 4] == static_cast<unsigned long long>(tick + 1))
         mod_event |= MOD_DA;
     synapse_plasticity_step(g, s, s.arrived,
         d.neuron_state[g.post].spike, excitatory_pair,
         d.neuron_state[g.post].recent_depol_mv, true, mod_event);
+}
+
+__global__ void synapse_plasticity(Device d, int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_synapses[ordinal];
+    int a = d.synapse_owner[i];
+    if (a < 0 || d.animals[a].alive != 1) return;
+    SynapseGene g = d.synapses[i];
+    if (!g.active || d.neuron_owner[g.pre] != a ||
+        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
+        !d.neurons[g.post].active) return;
+    SynapseState s = d.synapse_state[i];
+    plasticity_synapse(d, g, s, tick);
+    d.synapse_state[i] = s;
+}
+
+__global__ void synapse_plasticity_delivery(Device d, int64_t previous_tick,
+                                            int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_synapses[ordinal];
+    int a = d.synapse_owner[i];
+    if (a < 0 || d.animals[a].alive != 1) return;
+    SynapseGene g = d.synapses[i];
+    if (!g.active || d.neuron_owner[g.pre] != a ||
+        d.neuron_owner[g.post] != a || !d.neurons[g.pre].active ||
+        !d.neurons[g.post].active) return;
+    SynapseState s = d.synapse_state[i];
+    // Matches plasticity(previous_tick) before delivery(tick), with one
+    // synapse-state load/store and one launch for the pair of passes.
+    plasticity_synapse(d, g, s, previous_tick);
+    deliver_synapse(d, a, g, s, tick);
     d.synapse_state[i] = s;
 }
 
@@ -1356,7 +1413,8 @@ int main(int argc, char **argv) {
     int initial = 1024;
     int live_port = 8765;
     int trace_animal = -1;
-    bool visualize = false, steps_specified = false, silence_senses = false,
+    bool visualize = false, profile = false, legacy_neural = false,
+         steps_specified = false, silence_senses = false,
          silence_contact = false,
          instant_motors = false;
     float food_renewal = 0.0006f;
@@ -1373,13 +1431,15 @@ int main(int argc, char **argv) {
             food_renewal = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
         else if (!strcmp(argv[i], "--visualize")) visualize = true;
+        else if (!strcmp(argv[i], "--profile")) profile = true;
+        else if (!strcmp(argv[i], "--legacy-neural")) legacy_neural = true;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) live_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace-animal") && i + 1 < argc)
             trace_animal = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
         else if (!strcmp(argv[i], "--silence-contact")) silence_contact = true;
         else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--profile] [--legacy-neural] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
     }
     if (visualize && !steps_specified) steps = 0;
     if (steps < 0 || steps > INT64_MAX / TICKS ||
@@ -1427,7 +1487,7 @@ int main(int argc, char **argv) {
     allocate(d.active_synapse_counts, P);
     allocate(d.pending_exc, NEURON_CAPACITY * DENDRITES);
     allocate(d.pending_inh, NEURON_CAPACITY);
-    allocate(d.mod_event_tick, NEURON_CAPACITY * 3);
+    allocate(d.mod_event_tick, NEURON_CAPACITY * 6);
     allocate(d.spike_history, HISTORY * NEURON_CAPACITY);
     allocate(d.senses, P * S);
     allocate(d.motors, P * M); allocate(d.bite_intent, P);
@@ -1515,15 +1575,20 @@ int main(int argc, char **argv) {
     std::vector<int> active_neurons, active_synapses;
     std::vector<int> food, kind;
     std::vector<uint32_t> neuron_used, synapse_used;
+    double live_count_ms = 0, live_download_ms = 0, live_format_ms = 0;
+    int64_t live_profile_reports = 0;
     auto report = [&](int64_t step, bool log) {
+        auto phase_begin = std::chrono::steady_clock::now();
         count_brains<<<(P + 127) / 128, 128>>>(d);
         check(cudaDeviceSynchronize(), "simulation step");
         check(cudaGetLastError(), "CUDA kernel");
+        auto phase_counted = std::chrono::steady_clock::now();
         download(bodies, d.animals, P);
         download(active_neurons, d.active_neuron_counts, P);
         download(active_synapses, d.active_synapse_counts, P);
         download(food, d.food, W * H);
         if (live) download(kind, d.kind, W * H);
+        auto phase_downloaded = std::chrono::steady_clock::now();
         if (log) {
             download(neuron_used, d.neuron_used, NEURON_CAPACITY / 32);
             download(synapse_used, d.synapse_used, SYNAPSE_CAPACITY / 32);
@@ -1625,9 +1690,7 @@ int main(int argc, char **argv) {
                    (bite_history.front().second.step < step - 80 ||
                     bite_history.size() > 1024))
                 bite_history.pop_front();
-            std::ostringstream json;
-            json.setf(std::ios::fixed);
-            json.precision(2);
+            JsonBuilder json(static_cast<size_t>(alive) * 180 + W * H + 512);
             json << "{\"step\":" << step << ",\"total\":" << steps
                  << ",\"width\":" << W << ",\"height\":" << H
                  << ",\"population\":" << alive << ",\"births\":" << births
@@ -1697,9 +1760,22 @@ int main(int argc, char **argv) {
             json << "\"}";
             live->publish(json.str());
         }
+        if (profile && live && !log) {
+            auto phase_end = std::chrono::steady_clock::now();
+            auto milliseconds = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            live_count_ms += milliseconds(phase_begin, phase_counted);
+            live_download_ms += milliseconds(phase_counted, phase_downloaded);
+            live_format_ms += milliseconds(phase_downloaded, phase_end);
+            ++live_profile_reports;
+        }
     };
     report(0, true);
     int64_t last_step = 0;
+    double select_ms = 0, neural_ms = 0, world_ms = 0, report_ms = 0;
+    int64_t profile_steps = 0, profile_reports = 0;
+    auto simulation_start = std::chrono::steady_clock::now();
     for (int64_t step = 1; steps == 0 || step <= steps; ++step) {
         if (interrupted || (live && live->stop_requested())) break;
         if (live) {
@@ -1708,6 +1784,8 @@ int main(int argc, char **argv) {
             if (live->stop_requested() || interrupted) break;
         }
         auto frame_start = std::chrono::steady_clock::now();
+        if (profile) check(cudaDeviceSynchronize(), "profile start");
+        auto select_start = std::chrono::steady_clock::now();
         check(cub::DeviceSelect::If(selection_temp, selection_temp_bytes, slots,
               d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
               OwnedSlot{d.neuron_owner}), "select occupied neurons");
@@ -1719,18 +1797,59 @@ int main(int argc, char **argv) {
                          cudaMemcpyDeviceToHost), "occupied neuron count");
         check(cudaMemcpy(&synapse_count, d.occupied_synapse_count, sizeof(int),
                          cudaMemcpyDeviceToHost), "occupied synapse count");
+        auto neural_start = std::chrono::steady_clock::now();
+        const bool kernel_sample = profile && (step == 1 || step % 100 == 0);
+        cudaEvent_t kernel_start[3][TICKS], kernel_end[3][TICKS];
+        if (kernel_sample)
+            for (int group = 0; group < 3; ++group)
+                for (int t = 0; t < TICKS; ++t) {
+                    check(cudaEventCreate(&kernel_start[group][t]), "profile event");
+                    check(cudaEventCreate(&kernel_end[group][t]), "profile event");
+                }
         for (int t = 0; t < TICKS; ++t) {
             int64_t tick = (step - 1) * TICKS + t;
-            if (synapse_count)
-                synapse_delivery<<<(synapse_count + 255) / 256, 256>>>(
-                    d, tick, synapse_count);
+            if (kernel_sample) check(cudaEventRecord(kernel_start[0][t]), "profile delivery");
+            if (synapse_count) {
+                if (legacy_neural || t == 0)
+                    synapse_delivery<<<(synapse_count + NEURAL_BLOCK - 1) / NEURAL_BLOCK,
+                                       NEURAL_BLOCK>>>(
+                        d, tick, synapse_count);
+                else
+                    synapse_plasticity_delivery<<<(synapse_count + NEURAL_BLOCK - 1) / NEURAL_BLOCK,
+                                                  NEURAL_BLOCK>>>(
+                        d, tick - 1, tick, synapse_count);
+            }
+            if (kernel_sample) check(cudaEventRecord(kernel_end[0][t]), "profile delivery");
+            if (kernel_sample) check(cudaEventRecord(kernel_start[1][t]), "profile neuron");
             if (neuron_count)
-                neuron_step<<<(neuron_count + 255) / 256, 256>>>(
+                neuron_step<<<(neuron_count + NEURAL_BLOCK - 1) / NEURAL_BLOCK,
+                              NEURAL_BLOCK>>>(
                     d, tick, neuron_count);
-            if (synapse_count)
-                synapse_plasticity<<<(synapse_count + 255) / 256, 256>>>(
+            if (kernel_sample) check(cudaEventRecord(kernel_end[1][t]), "profile neuron");
+            if (kernel_sample) check(cudaEventRecord(kernel_start[2][t]), "profile plasticity");
+            if (synapse_count && (legacy_neural || t == TICKS - 1))
+                synapse_plasticity<<<(synapse_count + NEURAL_BLOCK - 1) / NEURAL_BLOCK,
+                                     NEURAL_BLOCK>>>(
                     d, tick, synapse_count);
+            if (kernel_sample) check(cudaEventRecord(kernel_end[2][t]), "profile plasticity");
         }
+        if (profile) check(cudaDeviceSynchronize(), "profile neural");
+        if (kernel_sample) {
+            float group_ms[3]{};
+            for (int group = 0; group < 3; ++group)
+                for (int t = 0; t < TICKS; ++t) {
+                    float elapsed = 0;
+                    check(cudaEventElapsedTime(&elapsed, kernel_start[group][t],
+                                               kernel_end[group][t]), "profile elapsed");
+                    group_ms[group] += elapsed;
+                    cudaEventDestroy(kernel_start[group][t]);
+                    cudaEventDestroy(kernel_end[group][t]);
+                }
+            std::cerr << "kernel step " << step << " ms synapse_update=" << group_ms[0]
+                      << " neuron=" << group_ms[1]
+                      << " plasticity_tail=" << group_ms[2] << '\n';
+        }
+        auto world_start = std::chrono::steady_clock::now();
         body_step<<<(P + 127) / 128, 128>>>(d);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
@@ -1744,13 +1863,50 @@ int main(int argc, char **argv) {
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
         update_senses<<<(P + 127) / 128, 128>>>(d);
+        if (profile) check(cudaDeviceSynchronize(), "profile world");
+        auto report_start = std::chrono::steady_clock::now();
         last_step = step;
         bool log = step % 100 == 0 || (steps > 0 && step == steps);
         if (log || (live && step % 2 == 0)) report(step, log);
+        if (profile) {
+            auto report_end = std::chrono::steady_clock::now();
+            auto milliseconds = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            select_ms += milliseconds(select_start, neural_start);
+            neural_ms += milliseconds(neural_start, world_start);
+            world_ms += milliseconds(world_start, report_start);
+            if (log || (live && step % 2 == 0)) {
+                report_ms += milliseconds(report_start, report_end);
+                ++profile_reports;
+            }
+            ++profile_steps;
+            if (step % 100 == 0 || (steps > 0 && step == steps)) {
+                std::cerr << "profile through step " << step
+                          << " avg_ms select=" << select_ms / profile_steps
+                          << " neural=" << neural_ms / profile_steps
+                          << " world=" << world_ms / profile_steps
+                          << " report=" << report_ms / profile_reports << '\n';
+            }
+        }
         if (live && live->speed() > 0) {
             int ms = live->speed() == 1 ? 50 : 12;
             std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(ms));
         }
+    }
+    if (profile && profile_steps) {
+        double wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - simulation_start).count();
+        double active_ms = select_ms + neural_ms + world_ms + report_ms;
+        std::cerr << "profile total steps=" << profile_steps
+                  << " wall_steps_per_second=" << profile_steps / wall_seconds
+                  << " active_steps_per_second=" << profile_steps * 1000.0 / active_ms
+                  << '\n';
+        if (live_profile_reports)
+            std::cerr << "profile live_report avg_ms count="
+                      << live_count_ms / live_profile_reports
+                      << " download=" << live_download_ms / live_profile_reports
+                      << " format=" << live_format_ms / live_profile_reports << '\n';
     }
     if (last_step > 0 && (steps == 0 || last_step < steps) &&
         last_step % 100 != 0)
