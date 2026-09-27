@@ -1,4 +1,6 @@
 #include <cuda_runtime.h>
+#include <cub/device/device_select.cuh>
+#include <thrust/iterator/counting_iterator.h>
 #include <png.h>
 #include "physiology.cuh"
 #include "live_view.hpp"
@@ -21,9 +23,9 @@
 #include <vector>
 
 namespace sim {
-constexpr int P = 2048;
-constexpr int NEURON_CAPACITY = 262144;
-constexpr int SYNAPSE_CAPACITY = 524288;
+constexpr int P = 32768;
+constexpr int NEURON_CAPACITY = 4194304;
+constexpr int SYNAPSE_CAPACITY = 8388608;
 constexpr int INITIAL_HIDDEN = 48;
 constexpr int INITIAL_SYNAPSES = 180;
 constexpr int LIFE_RECORD_CAPACITY = P * 16;
@@ -89,6 +91,8 @@ struct Device {
     unsigned long long *mod_event_tick;
     unsigned char *spike_history;
     int *neuron_owner, *synapse_owner, *neuron_next, *synapse_next;
+    int *occupied_neurons, *occupied_synapses;
+    int *occupied_neuron_count, *occupied_synapse_count;
     int *neuron_port, *neuron_clone;
     uint32_t *neuron_used, *synapse_used;
     int *active_neuron_counts, *active_synapse_counts;
@@ -100,6 +104,11 @@ struct Device {
     int *births, *deaths, *predation_deaths, *bites, *next_id;
     LifeRecord *life_records;
     int *life_count;
+};
+
+struct OwnedSlot {
+    const int *owner;
+    __device__ bool operator()(int slot) const { return owner[slot] >= 0; }
 };
 
 __host__ __device__ inline float clamp(float x, float lo, float hi) {
@@ -433,9 +442,10 @@ __global__ void update_senses(Device d) {
             d.food[contact_cell] > 0 && d.kind[contact_cell] == kind ? 1.0f : 0.0f;
 }
 
-__global__ void synapse_delivery(Device d, int64_t tick) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SYNAPSE_CAPACITY) return;
+__global__ void synapse_delivery(Device d, int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_synapses[ordinal];
     int a = d.synapse_owner[i];
     if (a < 0) return;
     if (d.animals[a].alive != 1) return;
@@ -478,9 +488,10 @@ __global__ void synapse_delivery(Device d, int64_t tick) {
     d.synapse_state[i] = state;
 }
 
-__global__ void neuron_step(Device d, int64_t tick) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= NEURON_CAPACITY) return;
+__global__ void neuron_step(Device d, int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_neurons[ordinal];
     int a = d.neuron_owner[i];
     if (a < 0) return;
     if (d.animals[a].alive != 1) return;
@@ -515,9 +526,10 @@ __global__ void neuron_step(Device d, int64_t tick) {
     d.neuron_state[i] = state;
 }
 
-__global__ void synapse_plasticity(Device d, int64_t tick) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SYNAPSE_CAPACITY) return;
+__global__ void synapse_plasticity(Device d, int64_t tick, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_synapses[ordinal];
     int a = d.synapse_owner[i];
     if (a < 0) return;
     if (d.animals[a].alive != 1) return;
@@ -687,9 +699,10 @@ __global__ void finish_predation(Device d) {
     atomicAdd(d.predation_deaths, 1);
 }
 
-__global__ void homeostasis_step(Device d) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= NEURON_CAPACITY) return;
+__global__ void homeostasis_step(Device d, int occupied_count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= occupied_count) return;
+    int i = d.occupied_neurons[ordinal];
     int a = d.neuron_owner[i];
     if (a < 0) return;
     if (d.animals[a].alive != 1 || !d.neurons[i].active) return;
@@ -1352,7 +1365,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
         else if (!strcmp(argv[i], "--silence-contact")) silence_contact = true;
         else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..2048] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
     }
     if (visualize && !steps_specified) steps = 0;
     if (steps < 0 || steps > INT64_MAX / TICKS ||
@@ -1386,6 +1399,10 @@ int main(int argc, char **argv) {
     allocate(d.synapse_state, SYNAPSE_CAPACITY);
     allocate(d.neuron_owner, NEURON_CAPACITY);
     allocate(d.synapse_owner, SYNAPSE_CAPACITY);
+    allocate(d.occupied_neurons, NEURON_CAPACITY);
+    allocate(d.occupied_synapses, SYNAPSE_CAPACITY);
+    allocate(d.occupied_neuron_count, 1);
+    allocate(d.occupied_synapse_count, 1);
     allocate(d.neuron_next, NEURON_CAPACITY);
     allocate(d.synapse_next, SYNAPSE_CAPACITY);
     allocate(d.neuron_port, NEURON_CAPACITY);
@@ -1412,6 +1429,17 @@ int main(int argc, char **argv) {
     allocate(d.next_id, 1);
     allocate(d.life_records, LIFE_RECORD_CAPACITY);
     allocate(d.life_count, 1);
+    auto slots = thrust::make_counting_iterator<int>(0);
+    size_t neuron_select_bytes = 0, synapse_select_bytes = 0;
+    check(cub::DeviceSelect::If(nullptr, neuron_select_bytes, slots,
+          d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
+          OwnedSlot{d.neuron_owner}), "neuron selection size");
+    check(cub::DeviceSelect::If(nullptr, synapse_select_bytes, slots,
+          d.occupied_synapses, d.occupied_synapse_count, SYNAPSE_CAPACITY,
+          OwnedSlot{d.synapse_owner}), "synapse selection size");
+    void *selection_temp = nullptr;
+    size_t selection_temp_bytes = std::max(neuron_select_bytes, synapse_select_bytes);
+    check(cudaMalloc(&selection_temp, selection_temp_bytes), "selection workspace");
     check(cudaMemset(d.neuron_owner, 0xff,
                      NEURON_CAPACITY * sizeof(int)), "neuron pool reset");
     check(cudaMemset(d.synapse_owner, 0xff,
@@ -1632,18 +1660,36 @@ int main(int argc, char **argv) {
             if (live->stop_requested() || interrupted) break;
         }
         auto frame_start = std::chrono::steady_clock::now();
+        check(cub::DeviceSelect::If(selection_temp, selection_temp_bytes, slots,
+              d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
+              OwnedSlot{d.neuron_owner}), "select occupied neurons");
+        check(cub::DeviceSelect::If(selection_temp, selection_temp_bytes, slots,
+              d.occupied_synapses, d.occupied_synapse_count, SYNAPSE_CAPACITY,
+              OwnedSlot{d.synapse_owner}), "select occupied synapses");
+        int neuron_count = 0, synapse_count = 0;
+        check(cudaMemcpy(&neuron_count, d.occupied_neuron_count, sizeof(int),
+                         cudaMemcpyDeviceToHost), "occupied neuron count");
+        check(cudaMemcpy(&synapse_count, d.occupied_synapse_count, sizeof(int),
+                         cudaMemcpyDeviceToHost), "occupied synapse count");
         for (int t = 0; t < TICKS; ++t) {
             int64_t tick = (step - 1) * TICKS + t;
-            synapse_delivery<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
-            neuron_step<<<(NEURON_CAPACITY + 255) / 256, 256>>>(d, tick);
-            synapse_plasticity<<<(SYNAPSE_CAPACITY + 255) / 256, 256>>>(d, tick);
+            if (synapse_count)
+                synapse_delivery<<<(synapse_count + 255) / 256, 256>>>(
+                    d, tick, synapse_count);
+            if (neuron_count)
+                neuron_step<<<(neuron_count + 255) / 256, 256>>>(
+                    d, tick, neuron_count);
+            if (synapse_count)
+                synapse_plasticity<<<(synapse_count + 255) / 256, 256>>>(
+                    d, tick, synapse_count);
         }
         body_step<<<(P + 127) / 128, 128>>>(d);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
         bite_animals<<<(P + 127) / 128, 128>>>(d);
         finish_predation<<<(P + 127) / 128, 128>>>(d);
-        homeostasis_step<<<(NEURON_CAPACITY + 255) / 256, 256>>>(d);
+        if (neuron_count)
+            homeostasis_step<<<(neuron_count + 255) / 256, 256>>>(d, neuron_count);
         reclaim_dead_genomes<<<(P + 127) / 128, 128>>>(d, step);
         reproduce<<<(P + 127) / 128, 128>>>(d);
         regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed, food_renewal);
@@ -1704,6 +1750,9 @@ int main(int argc, char **argv) {
     cudaFree(d.animals); cudaFree(d.neurons); cudaFree(d.synapses);
     cudaFree(d.neuron_state); cudaFree(d.synapse_state);
     cudaFree(d.neuron_owner); cudaFree(d.synapse_owner);
+    cudaFree(d.occupied_neurons); cudaFree(d.occupied_synapses);
+    cudaFree(d.occupied_neuron_count); cudaFree(d.occupied_synapse_count);
+    cudaFree(selection_temp);
     cudaFree(d.neuron_next); cudaFree(d.synapse_next);
     cudaFree(d.neuron_port); cudaFree(d.neuron_clone);
     cudaFree(d.neuron_used); cudaFree(d.synapse_used);
