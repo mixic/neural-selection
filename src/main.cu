@@ -42,7 +42,8 @@ constexpr int TICKS = 16;
 constexpr int NEURAL_BLOCK = 512;
 constexpr int BLOCK_BRAIN_NEURONS = 80;
 constexpr int BLOCK_BRAIN_SYNAPSES = 192;
-constexpr int BLOCK_BRAIN_WORDS = (BLOCK_BRAIN_SYNAPSES + 31) / 32;
+constexpr int MEDIUM_BRAIN_NEURONS = 128;
+constexpr int MEDIUM_BRAIN_SYNAPSES = 256;
 constexpr float BODY_UPKEEP = 0.003f;
 constexpr float NEURON_UPKEEP = 0.00002f;
 constexpr float BITE_DAMAGE = 2.0f;
@@ -106,6 +107,7 @@ struct Device {
     int *occupied_neurons, *occupied_synapses;
     int *occupied_neuron_count, *occupied_synapse_count;
     int *block_animals, *block_animal_count;
+    int *medium_animals, *medium_animal_count;
     int *neuron_port, *neuron_clone;
     uint32_t *neuron_used, *synapse_used;
     int *active_neuron_counts, *active_synapse_counts;
@@ -135,14 +137,26 @@ struct BlockAnimal {
     }
 };
 
+struct MediumAnimal {
+    const Animal *animals;
+    __device__ bool operator()(int slot) const {
+        const Animal &a = animals[slot];
+        return a.alive == 1 &&
+               (a.neuron_count > BLOCK_BRAIN_NEURONS ||
+                a.synapse_count > BLOCK_BRAIN_SYNAPSES) &&
+               a.neuron_count <= MEDIUM_BRAIN_NEURONS &&
+               a.synapse_count <= MEDIUM_BRAIN_SYNAPSES;
+    }
+};
+
 struct FallbackOwnedSlot {
     const int *owner;
     const Animal *animals;
     __device__ bool operator()(int slot) const {
         int a = owner[slot];
         return a >= 0 && animals[a].alive == 1 &&
-               (animals[a].neuron_count > BLOCK_BRAIN_NEURONS ||
-                animals[a].synapse_count > BLOCK_BRAIN_SYNAPSES);
+               (animals[a].neuron_count > MEDIUM_BRAIN_NEURONS ||
+                animals[a].synapse_count > MEDIUM_BRAIN_SYNAPSES);
     }
 };
 
@@ -645,32 +659,33 @@ __global__ void synapse_plasticity_delivery(Device d, int64_t previous_tick,
     d.synapse_state[i] = s;
 }
 
-template <bool EVENT> struct EventBrainData {};
-template <> struct EventBrainData<true> {
-    signed char last_plasticity[BLOCK_BRAIN_SYNAPSES];
-    unsigned char delay[BLOCK_BRAIN_SYNAPSES];
-    unsigned char edge_active[BLOCK_BRAIN_SYNAPSES];
-    unsigned char plastic_pair[BLOCK_BRAIN_SYNAPSES];
-    unsigned int arrival_mask[HISTORY * BLOCK_BRAIN_WORDS];
-    int out_head[BLOCK_BRAIN_NEURONS];
-    int next_out[BLOCK_BRAIN_SYNAPSES];
+template <int N, int E, bool EVENT> struct EventBrainData {};
+template <int N, int E> struct EventBrainData<N, E, true> {
+    signed char last_plasticity[E];
+    unsigned char delay[E];
+    unsigned char edge_active[E];
+    unsigned char plastic_pair[E];
+    unsigned int arrival_mask[HISTORY * ((E + 31) / 32)];
+    int out_head[N];
+    int next_out[E];
 };
 
-template <bool EVENT> struct alignas(16) BlockBrain : EventBrainData<EVENT> {
-    int neuron_ids[BLOCK_BRAIN_NEURONS];
-    int synapse_ids[BLOCK_BRAIN_SYNAPSES];
-    int pre[BLOCK_BRAIN_SYNAPSES], post[BLOCK_BRAIN_SYNAPSES];
-    int port[BLOCK_BRAIN_NEURONS];
-    NeuronState neuron_state[BLOCK_BRAIN_NEURONS];
-    SynapseState synapse_state[BLOCK_BRAIN_SYNAPSES];
-    float pending_exc[BLOCK_BRAIN_NEURONS * DENDRITES];
-    float pending_inh[BLOCK_BRAIN_NEURONS];
-    unsigned int mod_bits[BLOCK_BRAIN_NEURONS];
-    unsigned char history[HISTORY * BLOCK_BRAIN_NEURONS];
+template <int N, int E, bool EVENT> struct alignas(16) BlockBrain : EventBrainData<N, E, EVENT> {
+    int neuron_ids[N];
+    int synapse_ids[E];
+    int pre[E], post[E];
+    int port[N];
+    NeuronState neuron_state[N];
+    SynapseState synapse_state[E];
+    float pending_exc[N * DENDRITES];
+    float pending_inh[N];
+    unsigned int mod_bits[N];
+    unsigned char history[HISTORY * N];
 };
 
-__device__ inline void block_deliver_event(Device d, BlockBrain<true> &brain,
-                                           int animal, int edge, int64_t tick) {
+template <int N, int E> __device__ inline void block_deliver_event(
+        Device d, BlockBrain<N, E, true> &brain, int animal, int edge,
+        int64_t tick) {
     int pre = brain.pre[edge], post = brain.post[edge];
     SynapseGene g = d.synapses[brain.synapse_ids[edge]];
     SynapseState state = brain.synapse_state[edge];
@@ -702,14 +717,15 @@ __device__ inline void block_deliver_event(Device d, BlockBrain<true> &brain,
     brain.synapse_state[edge] = state;
 }
 
-template <bool EVENT_SYNAPSES>
-__global__ void brain_block_step(Device d, int animal_count, int64_t first_tick) {
+template <int N, int E, bool EVENT_SYNAPSES>
+__global__ void brain_block_step(Device d, const int *animal_slots,
+                                int animal_count, int64_t first_tick) {
     if (blockIdx.x >= animal_count) return;
-    int a = d.block_animals[blockIdx.x];
+    int a = animal_slots[blockIdx.x];
     if (d.animals[a].alive != 1) return;
     extern __shared__ __align__(16) unsigned char storage[];
-    BlockBrain<EVENT_SYNAPSES> &brain =
-        *reinterpret_cast<BlockBrain<EVENT_SYNAPSES> *>(storage);
+    BlockBrain<N, E, EVENT_SYNAPSES> &brain =
+        *reinterpret_cast<BlockBrain<N, E, EVENT_SYNAPSES> *>(storage);
     int lane = threadIdx.x;
     int neuron_count = d.animals[a].neuron_count;
     int synapse_count = d.animals[a].synapse_count;
@@ -731,7 +747,7 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
             brain.pending_exc[n * DENDRITES + branch] =
                 d.pending_exc[global * DENDRITES + branch];
         for (int delay = 0; delay < HISTORY; ++delay)
-            brain.history[delay * BLOCK_BRAIN_NEURONS + n] =
+            brain.history[delay * N + n] =
                 d.spike_history[delay * NEURON_CAPACITY + global];
     }
     for (int e = lane; e < synapse_count; e += blockDim.x)
@@ -739,7 +755,7 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
     if constexpr (EVENT_SYNAPSES) {
         for (int n = lane; n < neuron_count; n += blockDim.x)
             brain.out_head[n] = -1;
-        for (int word = lane; word < HISTORY * BLOCK_BRAIN_WORDS;
+        for (int word = lane; word < HISTORY * ((E + 31) / 32);
              word += blockDim.x)
             brain.arrival_mask[word] = 0;
     }
@@ -780,9 +796,9 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
                 int64_t source_tick = first_tick + t - delay;
                 if (source_tick < 0 || source_tick >= first_tick) continue;
                 if (brain.history[(source_tick % HISTORY) *
-                                  BLOCK_BRAIN_NEURONS + pre])
+                                  N + pre])
                     atomicOr(&brain.arrival_mask[((first_tick + t) % HISTORY) *
-                                  BLOCK_BRAIN_WORDS + e / 32], 1u << (e % 32));
+                                  ((E + 31) / 32) + e / 32], 1u << (e % 32));
             }
         }
     }
@@ -793,10 +809,10 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
             brain.mod_bits[n] = 0;
         __syncthreads();
         if constexpr (EVENT_SYNAPSES) {
-            for (int word = lane; word < BLOCK_BRAIN_WORDS;
+            for (int word = lane; word < ((E + 31) / 32);
                  word += blockDim.x) {
                 unsigned int bits = brain.arrival_mask[(tick % HISTORY) *
-                    BLOCK_BRAIN_WORDS + word];
+                    ((E + 31) / 32) + word];
                 while (bits) {
                     int bit = __ffs(bits) - 1;
                     int e = word * 32 + bit;
@@ -814,7 +830,7 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
             SynapseState state = brain.synapse_state[e];
                 state.arrived = tick >= g.delay &&
                     brain.history[((tick - g.delay) % HISTORY) *
-                                  BLOCK_BRAIN_NEURONS + pre];
+                                  N + pre];
             if (state.arrived) {
                 NeuronGene source = d.neurons[brain.neuron_ids[pre]];
                 float released = !source.inhibitory_transmitter || source.modulator
@@ -878,11 +894,11 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
                     for (int e = brain.out_head[n]; e >= 0;
                          e = brain.next_out[e]) {
                         int arrival = (tick + brain.delay[e]) % HISTORY;
-                        atomicOr(&brain.arrival_mask[arrival * BLOCK_BRAIN_WORDS +
+                        atomicOr(&brain.arrival_mask[arrival * ((E + 31) / 32) +
                                   e / 32], 1u << (e % 32));
                     }
             }
-            brain.history[(tick % HISTORY) * BLOCK_BRAIN_NEURONS + n] = state.spike;
+            brain.history[(tick % HISTORY) * N + n] = state.spike;
             brain.neuron_state[n] = state;
         }
         __syncthreads();
@@ -893,7 +909,7 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
                 if (!brain.edge_active[e]) continue;
                 SynapseState state = brain.synapse_state[e];
                 state.arrived = (brain.arrival_mask[(tick % HISTORY) *
-                    BLOCK_BRAIN_WORDS + e / 32] >> (e % 32)) & 1u;
+                    ((E + 31) / 32) + e / 32] >> (e % 32)) & 1u;
                 if (!brain.plastic_pair[e]) {
                     brain.synapse_state[e] = state;
                     continue;
@@ -931,9 +947,9 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
         }
         __syncthreads();
         if constexpr (EVENT_SYNAPSES) {
-            for (int word = lane; word < BLOCK_BRAIN_WORDS;
+            for (int word = lane; word < ((E + 31) / 32);
                  word += blockDim.x)
-                brain.arrival_mask[(tick % HISTORY) * BLOCK_BRAIN_WORDS + word] = 0;
+                brain.arrival_mask[(tick % HISTORY) * ((E + 31) / 32) + word] = 0;
             __syncthreads();
         }
     }
@@ -956,16 +972,17 @@ __global__ void brain_block_step(Device d, int animal_count, int64_t first_tick)
                 brain.pending_exc[n * DENDRITES + branch];
         for (int delay = 0; delay < HISTORY; ++delay)
             d.spike_history[delay * NEURON_CAPACITY + global] =
-                brain.history[delay * BLOCK_BRAIN_NEURONS + n];
+                brain.history[delay * N + n];
     }
     for (int e = lane; e < synapse_count; e += blockDim.x)
         d.synapse_state[brain.synapse_ids[e]] = brain.synapse_state[e];
 }
 
-__global__ void homeostasis_block_animals(Device d, int animal_count) {
+__global__ void homeostasis_block_animals(Device d, const int *animal_slots,
+                                          int animal_count) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= animal_count) return;
-    int a = d.block_animals[ordinal];
+    int a = animal_slots[ordinal];
     if (d.animals[a].alive != 1) return;
     float elapsed_ms = fmaxf(16.0f, d.animals[a].age * 16.0f);
     for (int n = d.animals[a].neuron_head; n >= 0; n = d.neuron_next[n]) {
@@ -1839,6 +1856,8 @@ int main(int argc, char **argv) {
     allocate(d.occupied_synapse_count, 1);
     allocate(d.block_animals, P);
     allocate(d.block_animal_count, 1);
+    allocate(d.medium_animals, P);
+    allocate(d.medium_animal_count, 1);
     allocate(d.neuron_next, NEURON_CAPACITY);
     allocate(d.synapse_next, SYNAPSE_CAPACITY);
     allocate(d.neuron_port, NEURON_CAPACITY);
@@ -1872,7 +1891,8 @@ int main(int argc, char **argv) {
     }
     auto slots = thrust::make_counting_iterator<int>(0);
     size_t neuron_select_bytes = 0, synapse_select_bytes = 0;
-    size_t animal_select_bytes = 0, fallback_neuron_bytes = 0,
+    size_t animal_select_bytes = 0, medium_select_bytes = 0,
+           fallback_neuron_bytes = 0,
            fallback_synapse_bytes = 0;
     check(cub::DeviceSelect::If(nullptr, neuron_select_bytes, slots,
           d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
@@ -1883,6 +1903,9 @@ int main(int argc, char **argv) {
     check(cub::DeviceSelect::If(nullptr, animal_select_bytes, slots,
           d.block_animals, d.block_animal_count, P,
           BlockAnimal{d.animals}), "animal selection size");
+    check(cub::DeviceSelect::If(nullptr, medium_select_bytes, slots,
+          d.medium_animals, d.medium_animal_count, P,
+          MediumAnimal{d.animals}), "medium animal selection size");
     check(cub::DeviceSelect::If(nullptr, fallback_neuron_bytes, slots,
           d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
           FallbackOwnedSlot{d.neuron_owner, d.animals}), "fallback neuron selection size");
@@ -1891,17 +1914,33 @@ int main(int argc, char **argv) {
           FallbackOwnedSlot{d.synapse_owner, d.animals}), "fallback synapse selection size");
     void *selection_temp = nullptr;
     size_t selection_temp_bytes = std::max({neuron_select_bytes, synapse_select_bytes,
-        animal_select_bytes, fallback_neuron_bytes, fallback_synapse_bytes});
+        animal_select_bytes, medium_select_bytes, fallback_neuron_bytes,
+        fallback_synapse_bytes});
     check(cudaMalloc(&selection_temp, selection_temp_bytes), "selection workspace");
     if (block_brains) {
-        if (event_synapses)
-            check(cudaFuncSetAttribute(brain_block_step<true>,
-                  cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(BlockBrain<true>)),
-                  "event brain shared memory");
-        else
-            check(cudaFuncSetAttribute(brain_block_step<false>,
-                  cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(BlockBrain<false>)),
-                  "brain block shared memory");
+        if (event_synapses) {
+            check(cudaFuncSetAttribute(brain_block_step<BLOCK_BRAIN_NEURONS,
+                  BLOCK_BRAIN_SYNAPSES, true>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  sizeof(BlockBrain<BLOCK_BRAIN_NEURONS, BLOCK_BRAIN_SYNAPSES, true>)),
+                  "small event brain shared memory");
+            check(cudaFuncSetAttribute(brain_block_step<MEDIUM_BRAIN_NEURONS,
+                  MEDIUM_BRAIN_SYNAPSES, true>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  sizeof(BlockBrain<MEDIUM_BRAIN_NEURONS, MEDIUM_BRAIN_SYNAPSES, true>)),
+                  "medium event brain shared memory");
+        } else {
+            check(cudaFuncSetAttribute(brain_block_step<BLOCK_BRAIN_NEURONS,
+                  BLOCK_BRAIN_SYNAPSES, false>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  sizeof(BlockBrain<BLOCK_BRAIN_NEURONS, BLOCK_BRAIN_SYNAPSES, false>)),
+                  "small brain shared memory");
+            check(cudaFuncSetAttribute(brain_block_step<MEDIUM_BRAIN_NEURONS,
+                  MEDIUM_BRAIN_SYNAPSES, false>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  sizeof(BlockBrain<MEDIUM_BRAIN_NEURONS, MEDIUM_BRAIN_SYNAPSES, false>)),
+                  "medium brain shared memory");
+        }
     }
     check(cudaMemset(d.neuron_owner, 0xff,
                      NEURON_CAPACITY * sizeof(int)), "neuron pool reset");
@@ -2175,6 +2214,9 @@ int main(int argc, char **argv) {
                   d.block_animals, d.block_animal_count, P,
                   BlockAnimal{d.animals}), "select block brains");
             check(cub::DeviceSelect::If(selection_temp, selection_temp_bytes, slots,
+                  d.medium_animals, d.medium_animal_count, P,
+                  MediumAnimal{d.animals}), "select medium brains");
+            check(cub::DeviceSelect::If(selection_temp, selection_temp_bytes, slots,
                   d.occupied_neurons, d.occupied_neuron_count, NEURON_CAPACITY,
                   FallbackOwnedSlot{d.neuron_owner, d.animals}),
                   "select fallback neurons");
@@ -2190,22 +2232,41 @@ int main(int argc, char **argv) {
                   d.occupied_synapses, d.occupied_synapse_count, SYNAPSE_CAPACITY,
                   OwnedSlot{d.synapse_owner}), "select occupied synapses");
         }
-        int neuron_count = 0, synapse_count = 0, block_count = 0;
+        int neuron_count = 0, synapse_count = 0, block_count = 0, medium_count = 0;
         check(cudaMemcpy(&neuron_count, d.occupied_neuron_count, sizeof(int),
                          cudaMemcpyDeviceToHost), "occupied neuron count");
         check(cudaMemcpy(&synapse_count, d.occupied_synapse_count, sizeof(int),
                          cudaMemcpyDeviceToHost), "occupied synapse count");
-        if (block_brains)
+        if (block_brains) {
             check(cudaMemcpy(&block_count, d.block_animal_count, sizeof(int),
                              cudaMemcpyDeviceToHost), "block brain count");
+            check(cudaMemcpy(&medium_count, d.medium_animal_count, sizeof(int),
+                             cudaMemcpyDeviceToHost), "medium brain count");
+        }
         auto neural_start = std::chrono::steady_clock::now();
         if (block_count) {
             if (event_synapses)
-                brain_block_step<true><<<block_count, 128, sizeof(BlockBrain<true>)>>>(
-                    d, block_count, (step - 1) * TICKS);
+                brain_block_step<BLOCK_BRAIN_NEURONS, BLOCK_BRAIN_SYNAPSES, true>
+                    <<<block_count, 128, sizeof(BlockBrain<BLOCK_BRAIN_NEURONS,
+                                                        BLOCK_BRAIN_SYNAPSES, true>)>>>(
+                    d, d.block_animals, block_count, (step - 1) * TICKS);
             else
-                brain_block_step<false><<<block_count, 128, sizeof(BlockBrain<false>)>>>(
-                    d, block_count, (step - 1) * TICKS);
+                brain_block_step<BLOCK_BRAIN_NEURONS, BLOCK_BRAIN_SYNAPSES, false>
+                    <<<block_count, 128, sizeof(BlockBrain<BLOCK_BRAIN_NEURONS,
+                                                        BLOCK_BRAIN_SYNAPSES, false>)>>>(
+                    d, d.block_animals, block_count, (step - 1) * TICKS);
+        }
+        if (medium_count) {
+            if (event_synapses)
+                brain_block_step<MEDIUM_BRAIN_NEURONS, MEDIUM_BRAIN_SYNAPSES, true>
+                    <<<medium_count, 128, sizeof(BlockBrain<MEDIUM_BRAIN_NEURONS,
+                                                         MEDIUM_BRAIN_SYNAPSES, true>)>>>(
+                    d, d.medium_animals, medium_count, (step - 1) * TICKS);
+            else
+                brain_block_step<MEDIUM_BRAIN_NEURONS, MEDIUM_BRAIN_SYNAPSES, false>
+                    <<<medium_count, 128, sizeof(BlockBrain<MEDIUM_BRAIN_NEURONS,
+                                                         MEDIUM_BRAIN_SYNAPSES, false>)>>>(
+                    d, d.medium_animals, medium_count, (step - 1) * TICKS);
         }
         const bool kernel_sample = profile && !block_brains &&
                                    (step == 1 || step % 100 == 0);
@@ -2269,7 +2330,10 @@ int main(int argc, char **argv) {
             homeostasis_step<<<(neuron_count + 255) / 256, 256>>>(d, neuron_count);
         if (block_count)
             homeostasis_block_animals<<<(block_count + 127) / 128, 128>>>(
-                d, block_count);
+                d, d.block_animals, block_count);
+        if (medium_count)
+            homeostasis_block_animals<<<(medium_count + 127) / 128, 128>>>(
+                d, d.medium_animals, medium_count);
         reclaim_dead_genomes<<<(P + 127) / 128, 128>>>(d, step);
         reproduce<<<(P + 127) / 128, 128>>>(d);
         regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed, food_renewal);
@@ -2370,6 +2434,7 @@ int main(int argc, char **argv) {
     cudaFree(d.occupied_neurons); cudaFree(d.occupied_synapses);
     cudaFree(d.occupied_neuron_count); cudaFree(d.occupied_synapse_count);
     cudaFree(d.block_animals); cudaFree(d.block_animal_count);
+    cudaFree(d.medium_animals); cudaFree(d.medium_animal_count);
     cudaFree(selection_temp);
     cudaFree(d.neuron_next); cudaFree(d.synapse_next);
     cudaFree(d.neuron_port); cudaFree(d.neuron_clone);
