@@ -553,4 +553,35 @@ NS_HD inline void synapse_plasticity_step(const SynapseGene &g, SynapseState &s,
     }
     s.weight_ns = bound(s.weight_ns, 0.0f, 2.0f * g.initial_weight_ns);
 }
+
+// Advance the state that changes during ticks with no pre/post spike and no
+// modulatory event. Event-driven execution calls this before the next event.
+NS_HD inline void synapse_plasticity_quiet(const SynapseGene &g, SynapseState &s,
+                                           int ticks) {
+    if (ticks <= 0 || !g.plasticity) return;
+    float elapsed = ticks * DT_MS;
+    if (g.plasticity == 5) {
+        if (s.structural_age_ms >= 0) {
+            s.structural_age_ms += elapsed;
+            if (s.structural_age_ms > 5000.0f) s.structural_age_ms = -1;
+        }
+        s.pre_age_ms += elapsed;
+    } else if (g.plasticity == 4) {
+        if (s.da_age_ms >= 0) {
+            s.da_age_ms += elapsed;
+            if (s.da_age_ms > 20000.0f) s.da_age_ms = -1;
+        }
+        s.pre_age_ms += elapsed;
+    } else if (g.plasticity == 3) {
+        s.eligible_ltp *= expf(-elapsed / 7200.0f);
+        s.eligible_ltd *= expf(-elapsed / 3600.0f);
+        s.pre_age_ms += elapsed;
+        s.post_age_ms += elapsed;
+    } else {
+        s.pre_trace *= expf(-elapsed / LTP_TRACE_MS);
+        s.post_trace *= expf(-elapsed / LTD_TRACE_MS);
+        s.pre_age_ms += elapsed;
+        s.post_age_ms += elapsed;
+    }
+}
 } // namespace sim
