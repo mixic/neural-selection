@@ -2,6 +2,7 @@
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 #include <png.h>
+#include <zlib.h>
 #include "physiology.cuh"
 #include "live_view.hpp"
 
@@ -12,16 +13,20 @@
 #include <csignal>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <unistd.h>
 
 namespace sim {
 constexpr int P = 32768;
@@ -122,6 +127,90 @@ struct Device {
     BiteEvent *bite_events;
     int *bite_event_count;
 };
+
+struct CheckpointNeuron {
+    int slot, owner, next, port;
+    NeuronGene gene;
+    NeuronState state;
+    float pending_exc[DENDRITES], pending_inh;
+    unsigned long long mod_event_tick[6];
+    unsigned char spike_history[HISTORY];
+};
+
+struct CheckpointSynapse {
+    int slot, owner, next;
+    SynapseGene gene;
+    SynapseState state;
+};
+
+__global__ void pack_checkpoint_neurons(Device d, const int *slots, int count,
+                                        CheckpointNeuron *packed) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= count) return;
+    int slot = slots[ordinal];
+    CheckpointNeuron record{};
+    record.slot = slot;
+    record.owner = d.neuron_owner[slot];
+    record.next = d.neuron_next[slot];
+    record.port = d.neuron_port[slot];
+    record.gene = d.neurons[slot];
+    record.state = d.neuron_state[slot];
+    for (int branch = 0; branch < DENDRITES; ++branch)
+        record.pending_exc[branch] = d.pending_exc[slot * DENDRITES + branch];
+    record.pending_inh = d.pending_inh[slot];
+    for (int event = 0; event < 6; ++event)
+        record.mod_event_tick[event] = d.mod_event_tick[slot * 6 + event];
+    for (int delay = 0; delay < HISTORY; ++delay)
+        record.spike_history[delay] =
+            d.spike_history[delay * NEURON_CAPACITY + slot];
+    packed[ordinal] = record;
+}
+
+__global__ void unpack_checkpoint_neurons(Device d,
+                                          const CheckpointNeuron *packed,
+                                          int count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= count) return;
+    CheckpointNeuron record = packed[ordinal];
+    int slot = record.slot;
+    d.neuron_owner[slot] = record.owner;
+    d.neuron_next[slot] = record.next;
+    d.neuron_port[slot] = record.port;
+    d.neurons[slot] = record.gene;
+    d.neuron_state[slot] = record.state;
+    for (int branch = 0; branch < DENDRITES; ++branch)
+        d.pending_exc[slot * DENDRITES + branch] = record.pending_exc[branch];
+    d.pending_inh[slot] = record.pending_inh;
+    for (int event = 0; event < 6; ++event)
+        d.mod_event_tick[slot * 6 + event] = record.mod_event_tick[event];
+    for (int delay = 0; delay < HISTORY; ++delay)
+        d.spike_history[delay * NEURON_CAPACITY + slot] =
+            record.spike_history[delay];
+    atomicOr(&d.neuron_used[slot / 32], 1u << (slot % 32));
+}
+
+__global__ void pack_checkpoint_synapses(Device d, const int *slots, int count,
+                                         CheckpointSynapse *packed) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= count) return;
+    int slot = slots[ordinal];
+    packed[ordinal] = {slot, d.synapse_owner[slot], d.synapse_next[slot],
+                       d.synapses[slot], d.synapse_state[slot]};
+}
+
+__global__ void unpack_checkpoint_synapses(Device d,
+                                           const CheckpointSynapse *packed,
+                                           int count) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= count) return;
+    CheckpointSynapse record = packed[ordinal];
+    int slot = record.slot;
+    d.synapse_owner[slot] = record.owner;
+    d.synapse_next[slot] = record.next;
+    d.synapses[slot] = record.gene;
+    d.synapse_state[slot] = record.state;
+    atomicOr(&d.synapse_used[slot / 32], 1u << (slot % 32));
+}
 
 struct OwnedSlot {
     const int *owner;
@@ -1775,6 +1864,7 @@ void write_life_record(std::ostream &out, const LifeRecord &record) {
     out << '\n';
 }
 
+#include "checkpoint_impl.cuh"
 } // namespace sim
 
 volatile std::sig_atomic_t interrupted = 0;
@@ -1794,6 +1884,9 @@ int main(int argc, char **argv) {
     float food_renewal = 0.0006f;
     unsigned long long seed = 1;
     std::string output = "run.csv";
+    std::string checkpoint_path, resume_path;
+    bool output_specified = false, interval_specified = false;
+    int64_t checkpoint_every = 10000;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
             steps = strtoll(argv[++i], nullptr, 10);
@@ -1803,7 +1896,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--food-renewal") && i + 1 < argc)
             food_renewal = strtof(argv[++i], nullptr);
-        else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
+        else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+            output = argv[++i]; output_specified = true;
+        }
+        else if (!strcmp(argv[i], "--checkpoint") && i + 1 < argc)
+            checkpoint_path = argv[++i];
+        else if (!strcmp(argv[i], "--checkpoint-every") && i + 1 < argc) {
+            checkpoint_every = strtoll(argv[++i], nullptr, 10);
+            interval_specified = true;
+        }
+        else if (!strcmp(argv[i], "--resume") && i + 1 < argc)
+            resume_path = argv[++i];
         else if (!strcmp(argv[i], "--visualize")) visualize = true;
         else if (!strcmp(argv[i], "--profile")) profile = true;
         else if (!strcmp(argv[i], "--legacy-neural")) legacy_neural = true;
@@ -1815,17 +1918,58 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
         else if (!strcmp(argv[i], "--silence-contact")) silence_contact = true;
         else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--profile] [--legacy-neural] [--block-brains] [--event-synapses] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--profile] [--legacy-neural] [--block-brains] [--event-synapses] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors] [--checkpoint file.gz] [--checkpoint-every steps] [--resume file.gz]\n"; return 2; }
+    }
+    gzFile resume_file = nullptr;
+    CheckpointHeader resume_header{};
+    if (!resume_path.empty()) {
+        resume_file = gzopen(resume_path.c_str(), "rb");
+        if (!resume_file) {
+            std::cerr << "Cannot open checkpoint: " << resume_path << '\n';
+            return 1;
+        }
+        try {
+            checkpoint_read_bytes(resume_file, &resume_header, sizeof(resume_header));
+            checkpoint_validate_header(resume_header);
+        } catch (const std::exception &error) {
+            std::cerr << error.what() << '\n';
+            gzclose(resume_file);
+            return 1;
+        }
+        seed = resume_header.seed;
+        initial = resume_header.initial;
+        trace_animal = resume_header.trace_animal;
+        food_renewal = resume_header.food_renewal;
+        block_brains = resume_header.flags & 1;
+        event_synapses = resume_header.flags & 2;
+        legacy_neural = resume_header.flags & 4;
+        silence_senses = resume_header.flags & 8;
+        silence_contact = resume_header.flags & 16;
+        instant_motors = resume_header.flags & 32;
+        if (!output_specified) output = resume_header.output;
+        if (!steps_specified) steps = 0;
+        if (!interval_specified) checkpoint_every = resume_header.checkpoint_every;
+        if (checkpoint_path.empty()) checkpoint_path = resume_path;
     }
     block_brains |= event_synapses;
     if (visualize && !steps_specified) steps = 0;
+    if (checkpoint_path.empty() && (visualize || interval_specified))
+        checkpoint_path = output + ".checkpoint.gz";
+    if (resume_path.empty() && !checkpoint_path.empty() &&
+        std::filesystem::exists(checkpoint_path)) {
+        std::cerr << "Checkpoint already exists: " << checkpoint_path
+                  << ". Use --resume or choose another output/checkpoint path.\n";
+        return 2;
+    }
     if (steps < 0 || steps > INT64_MAX / TICKS ||
+        checkpoint_every <= 0 || output.size() >= sizeof(resume_header.output) ||
         initial < 1 || initial > P || trace_animal >= initial || trace_animal < -1 ||
         !std::isfinite(food_renewal) ||
         food_renewal < 0 || food_renewal > 1 || live_port < 1 || live_port > 65535) {
         std::cerr << "Invalid steps, population, food renewal, or port\n"; return 2;
     }
     std::signal(SIGINT, on_interrupt);
+    std::signal(SIGTERM, on_interrupt);
     std::unique_ptr<LiveView> live;
     if (visualize) {
         try { live = std::make_unique<LiveView>(live_port); }
@@ -1966,35 +2110,76 @@ int main(int argc, char **argv) {
                      cudaMemcpyHostToDevice), "trace reset");
     check(cudaMemset(d.founder_observed_steps, 0, sizeof(int)), "founder activity reset");
     check(cudaMemcpy(d.next_id, &initial, sizeof(int), cudaMemcpyHostToDevice), "counter init");
-    init_world<<<(W * H + 255) / 256, 256>>>(d, seed);
-    init_animals<<<(P + 127) / 128, 128>>>(d, initial, seed);
+    BehaviorTotals dead_totals;
+    std::deque<std::pair<int64_t, BehaviorTotals>> behavior_history;
+    std::deque<std::pair<uint64_t, BiteEvent>> bite_history;
+    uint64_t next_bite_event_id = 1;
+    const bool resumed = resume_file != nullptr;
+    const bool append_logs = resumed &&
+        std::filesystem::weakly_canonical(output) ==
+        std::filesystem::weakly_canonical(resume_header.output);
+    if (resumed) {
+        try {
+            checkpoint_read_state(resume_file, d, resume_header, dead_totals,
+                                  behavior_history, bite_history,
+                                  next_bite_event_id);
+            int close_status = gzclose(resume_file);
+            resume_file = nullptr;
+            if (close_status != Z_OK)
+                throw std::runtime_error("Checkpoint checksum failed");
+        } catch (const std::exception &error) {
+            if (resume_file) gzclose(resume_file);
+            std::cerr << "Cannot resume: " << error.what() << '\n';
+            return 1;
+        }
+        std::cout << "Restored world at step " << resume_header.step << " from "
+                  << resume_path << '\n';
+    } else {
+        init_world<<<(W * H + 255) / 256, 256>>>(d, seed);
+        init_animals<<<(P + 127) / 128, 128>>>(d, initial, seed);
+    }
     check(cudaMemset(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
     index_animals<<<(P + 127) / 128, 128>>>(d);
-    update_senses<<<(P + 127) / 128, 128>>>(d);
+    if (!resumed) update_senses<<<(P + 127) / 128, 128>>>(d);
     check(cudaDeviceSynchronize(), "initialization");
-    std::ofstream csv(output);
-    std::ofstream behavior_csv(output + ".behavior.csv");
-    std::ofstream lives_csv(output + ".lives.csv");
+    if (append_logs) {
+        try {
+            const std::pair<std::string, uint64_t> files[] = {
+                {output, resume_header.csv_size},
+                {output + ".behavior.csv", resume_header.behavior_size},
+                {output + ".lives.csv", resume_header.lives_size}};
+            for (const auto &[path, size] : files) {
+                if (std::filesystem::file_size(path) < size)
+                    throw std::runtime_error("History file is shorter than checkpoint: " + path);
+                std::filesystem::resize_file(path, size);
+            }
+        } catch (const std::exception &error) {
+            std::cerr << "Cannot restore history: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    auto log_mode = std::ios::out | (append_logs ? std::ios::app : std::ios::trunc);
+    std::ofstream csv(output, log_mode);
+    std::ofstream behavior_csv(output + ".behavior.csv", log_mode);
+    std::ofstream lives_csv(output + ".lives.csv", log_mode);
     if (!csv || !behavior_csv || !lives_csv) {
         std::cerr << "Cannot open output files\n"; return 1;
     }
-    csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots,founder_observed_steps,founder_forward_steps,founder_left_steps,founder_right_steps,founder_eat_steps,founder_bite_steps\n";
-    behavior_csv << "step";
-    write_behavior_header(behavior_csv);
-    behavior_csv << '\n';
-    lives_csv << "death_step,id,parent_id,generation,age,death_cause,offspring,"
-                 "neuron_count,active_neurons,synapse_count,active_synapses,"
-                 "modulatory_neurons,plastic_synapses,mean_abs_weight_change,"
-                 "energy,health,first_b_age";
-    write_behavior_header(lives_csv);
-    lives_csv << '\n';
-    BehaviorTotals dead_totals;
-    std::deque<std::pair<int64_t, BehaviorTotals>> behavior_history;
+    if (!append_logs) {
+        csv << "step,population,births,deaths,predation_deaths,bites,food_cells,max_generation,mean_energy,mean_neurons,mean_synapses,allocated_neurons,allocated_synapses,max_neuron_slots,max_synapse_slots,founder_observed_steps,founder_forward_steps,founder_left_steps,founder_right_steps,founder_eat_steps,founder_bite_steps\n";
+        behavior_csv << "step";
+        write_behavior_header(behavior_csv);
+        behavior_csv << '\n';
+        lives_csv << "death_step,id,parent_id,generation,age,death_cause,offspring,"
+                     "neuron_count,active_neurons,synapse_count,active_synapses,"
+                     "modulatory_neurons,plastic_synapses,mean_abs_weight_change,"
+                     "energy,health,first_b_age";
+        write_behavior_header(lives_csv);
+        lives_csv << '\n';
+    }
     std::vector<Animal> bodies;
     std::vector<LifeRecord> recent_lives;
     std::vector<BiteEvent> recent_bites;
-    std::deque<std::pair<uint64_t, BiteEvent>> bite_history;
-    uint64_t next_bite_event_id = 1;
     std::vector<int> active_neurons, active_synapses;
     std::vector<int> food, kind;
     std::vector<uint32_t> neuron_used, synapse_used;
@@ -2194,12 +2379,55 @@ int main(int argc, char **argv) {
             ++live_profile_reports;
         }
     };
-    report(0, true);
-    int64_t last_step = 0;
+    auto save_checkpoint = [&](int64_t step) {
+        if (checkpoint_path.empty()) return;
+        try {
+            csv.flush(); behavior_csv.flush(); lives_csv.flush();
+            if (!csv || !behavior_csv || !lives_csv)
+                throw std::runtime_error("Cannot flush history before checkpoint");
+            CheckpointHeader header{};
+            std::memcpy(header.magic, "NSCHKP01", 8);
+            header.version = CHECKPOINT_VERSION;
+            header.endian = 0x01020304u;
+            header.layout = checkpoint_layout();
+            header.step = step;
+            header.checkpoint_every = checkpoint_every;
+            header.seed = seed;
+            header.initial = initial;
+            header.trace_animal = trace_animal;
+            header.food_renewal = food_renewal;
+            header.flags = (block_brains ? 1u : 0u) |
+                           (event_synapses ? 2u : 0u) |
+                           (legacy_neural ? 4u : 0u) |
+                           (silence_senses ? 8u : 0u) |
+                           (silence_contact ? 16u : 0u) |
+                           (instant_motors ? 32u : 0u);
+            header.csv_size = std::filesystem::file_size(output);
+            header.behavior_size = std::filesystem::file_size(output + ".behavior.csv");
+            header.lives_size = std::filesystem::file_size(output + ".lives.csv");
+            std::memcpy(header.output, output.c_str(), output.size() + 1);
+            checkpoint_atomic_save(checkpoint_path, d, selection_temp,
+                                   selection_temp_bytes, header, dead_totals,
+                                   behavior_history, bite_history,
+                                   next_bite_event_id);
+            std::cout << "Checkpoint step " << step << " saved to "
+                      << checkpoint_path << '\n' << std::flush;
+        } catch (const std::exception &error) {
+            std::cerr << "Checkpoint failed: " << error.what() << '\n';
+            std::exit(1);
+        }
+    };
+    if (resumed) {
+        if (live || !append_logs) report(resume_header.step, !append_logs);
+    } else {
+        report(0, true);
+        save_checkpoint(0);
+    }
+    int64_t last_step = resumed ? resume_header.step : 0;
     double select_ms = 0, neural_ms = 0, world_ms = 0, report_ms = 0;
     int64_t profile_steps = 0, profile_reports = 0;
     auto simulation_start = std::chrono::steady_clock::now();
-    for (int64_t step = 1; steps == 0 || step <= steps; ++step) {
+    for (int64_t step = last_step + 1; steps == 0 || step <= steps; ++step) {
         if (interrupted || (live && live->stop_requested())) break;
         if (live) {
             while (live->paused() && !live->stop_requested() && !interrupted)
@@ -2343,8 +2571,12 @@ int main(int argc, char **argv) {
         if (profile) check(cudaDeviceSynchronize(), "profile world");
         auto report_start = std::chrono::steady_clock::now();
         last_step = step;
-        bool log = step % 100 == 0 || (steps > 0 && step == steps);
+        bool checkpoint_due = !checkpoint_path.empty() &&
+                              step % checkpoint_every == 0;
+        bool log = step % 100 == 0 || checkpoint_due ||
+                   (steps > 0 && step == steps);
         if (log || (live && step % 2 == 0)) report(step, log);
+        if (checkpoint_due) save_checkpoint(step);
         if (profile) {
             auto report_end = std::chrono::steady_clock::now();
             auto milliseconds = [](auto a, auto b) {
@@ -2388,6 +2620,9 @@ int main(int argc, char **argv) {
     if (last_step > 0 && (steps == 0 || last_step < steps) &&
         last_step % 100 != 0)
         report(last_step, true);
+    if (!checkpoint_path.empty() && last_step > 0 &&
+        last_step % checkpoint_every != 0)
+        save_checkpoint(last_step);
     write_world(output + ".png", d);
     write_brains(output, d);
     if (trace_animal >= 0) {

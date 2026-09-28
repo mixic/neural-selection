@@ -4,7 +4,7 @@ A CUDA C++ simulation of animals with evolved spiking brains in a shared 2D worl
 
 ## Build and run
 
-Requires an NVIDIA GPU, CUDA Toolkit with `nvcc`, CMake, a C++ compiler, and libpng development headers.
+Requires an NVIDIA GPU, CUDA Toolkit with `nvcc`, CMake, a C++ compiler, and libpng and zlib development headers.
 
 ```sh
 cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
@@ -20,6 +20,8 @@ For a live view, add `--visualize` and open the local address printed by the pro
 ```
 
 Live runs have no step limit unless you set `--steps N`. `--steps 0` also selects an unlimited run without the browser. The browser view shows the 2D food map and moving, oriented animals, with pulses for births and deaths and orange flashes at exact bite locations, live population and event counts, global animal and brain-slot usage, a population chart, and details for a clicked animal. Drag to pan, scroll to zoom, and use the controls to pause, resume, change speed, or end the run. At 1× the program targets 20 world steps per second; 4× targets 80; Max runs at GPU speed. The page updates every two world steps. End run writes the final image and brain tables and leaves the page open for inspection; Ctrl+C saves and exits. Use `--port N` if port 8765 is occupied. The server listens only on `127.0.0.1`.
+
+Live runs now save an atomic, compressed checkpoint at step 0, every 10,000 world steps, and on a normal stop. It defaults to `<output>.checkpoint.gz`. To continue after a crash, run `./build/neural_selection --resume run.csv.checkpoint.gz --visualize`. The saved world includes living genomes, learned synaptic weights, neuron voltages and other dynamic state, resource and body state, random generators, and world history counters. Resume restores the saved simulation settings and returns to the last completed checkpoint; steps after it are lost. When continuing into the same output files, history rows beyond that step are removed before new rows are appended. Starting a new run refuses to overwrite an existing checkpoint. `--checkpoint-every N` changes the interval; `--checkpoint file.gz` enables checkpointing for a run without the live view or changes the destination. A checkpoint only loads into a build with a matching state layout and compatible simulation rules. The pre-checkpoint live run from September 2026 cannot be resumed from its CSV files.
 
 Use `--profile` for per-stage timing and sampled delivery, neuron, and plasticity kernel times. It synchronizes the GPU to measure stages, so its throughput includes profiling overhead. `--legacy-neural` retains the original separate delivery and plasticity launches for comparisons; the default pipelines plasticity from one tick with delivery for the next while preserving their order. The modulatory event timestamps use alternating tick slots so a new delivery cannot overwrite the previous tick's event during the combined pass.
 

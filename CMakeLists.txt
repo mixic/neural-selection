@@ -9,7 +9,7 @@ target_compile_options(neural_selection PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use
 target_compile_definitions(neural_selection PRIVATE LIVE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 find_package(PNG REQUIRED)
 find_package(Threads REQUIRED)
-target_link_libraries(neural_selection PRIVATE PNG::PNG Threads::Threads)
+target_link_libraries(neural_selection PRIVATE PNG::PNG z Threads::Threads)
 
 add_executable(physiology_protocols tests/physiology.cpp)
 target_include_directories(physiology_protocols PRIVATE src)
