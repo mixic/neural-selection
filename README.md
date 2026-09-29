@@ -1,91 +1,118 @@
 # Neural Selection
 
-A CUDA C++ simulation of animals with evolved spiking brains in a shared 2D world. Animals sense food, nearby animals, hunger, fullness, taste, and injury; move, eat, and bite; compete for resources; and reproduce with mutations to their neural genomes. The world supplies no reward or fitness value to the brain. Survival and reproduction follow from body state and resource use.
+**Evolving spiking brains in a shared world.**
 
-## Build and run
+A CUDA C++ artificial-life simulation in which animals move, eat, bite one another, compete for resources, and reproduce. Each animal has its own mutable neural genome and a brain that processes sensory input through discrete spikes.
 
-Requires an NVIDIA GPU, CUDA Toolkit with `nvcc`, CMake, a C++ compiler, and libpng and zlib development headers.
+Survival is determined by the world. There is no fitness score or reward value supplied to the brain.
+
+![Live world: moving animals, food resources and bite events](docs/images/world.gif)
+
+*An evolving population in the live world viewer. Food is shown in green, orange and blue; orange rings mark bites.*
+
+## Look inside a brain
+
+Select an animal to explore its actual network, including feedback loops, synaptic weights and firing activity. Axons branch into terminals meeting the receiving neuron's dendrites. Hover a neuron for its voltage and firing rate, or a terminal for its synapse's weight, delay and target branch.
+
+![Live brain: branching axons, dendritic contacts and recorded firing activity](docs/images/brain.gif)
+
+*Timelapse captures from the running simulator. Shapes and positions are schematic; connections and spike counters come from the selected animal. Travelling pulses are slowed for visibility and do not imply successful synaptic release.*
+
+## What evolves?
+
+- **Brain design.** Neuron types, excitatory or inhibitory transmission, modulators, sensory assignments, connectivity, delays and synaptic parameters can mutate. Mutations can add, silence or remove neurons and connections.
+- **Activity and plasticity.** Membrane dynamics produce spikes; synapses can facilitate, depress, and change strength through timing and modulatory mechanisms.
+- **Ecological strategies.** Fixed senses report food identity, nearby animals, hunger, fullness, taste and pain. Five motor outputs control forward movement, turning, eating and biting.
+- **Brain size.** Larger active brains cost more energy. All animals share global neuron and synapse pools, with no fixed brain-size allotment per animal.
+
+Offspring inherit the genome's initial parameters and connections. They start with fresh neural state; a parent's learned synaptic weights and other lifetime neural state are not copied.
+
+## Build and watch
+
+Requires an NVIDIA GPU, a CUDA Toolkit with `nvcc`, CMake 3.24 or later, a compatible C++ compiler, and libpng and zlib development headers.
 
 ```sh
-cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build build -j
+
+mkdir -p runs
+./build/neural_selection \
+  --population 2048 --seed 2 --visualize \
+  --output runs/world.csv
+```
+
+Open **[localhost:8765](http://127.0.0.1:8765/)**. The run continues indefinitely. Click an animal to inspect it, scroll to zoom, and drag to pan. The brain panel has an expanded view. The toolbar controls pause, speed and stopping.
+
+| Speed | World steps per second |
+| --- | --- |
+| 1× | 20 |
+| 4× | 80 |
+| Max | As fast as the GPU allows |
+
+Each world step advances 16 neural ticks of 1 ms. For a finite run, add `--steps 2000`. Use `--port N` to choose another local port. If configuring on a different machine, replace `native` with your target GPU's CUDA architecture.
+
+### Keep a run alive when the terminal closes
+
+With tmux installed:
+
+```sh
+tmux new-session -d -s neural-selection \
+  './build/neural_selection --population 2048 --seed 2 --visualize --output runs/world.csv'
+```
+
+Attach with `tmux attach -t neural-selection`. Detach with **Ctrl+B, then D**. A tmux session survives closing the terminal or app; resumable checkpoints handle machine restarts.
+
+### Save and resume
+
+Live runs save an atomic, compressed checkpoint every **10,000 world steps**, at initialization, and on a normal stop. Checkpoints include the complete evolving world: genomes, learned synaptic state, neuron state, body state, resources, random generators and history counters.
+
+```sh
+./build/neural_selection \
+  --resume runs/world.csv.checkpoint.gz --visualize
+```
+
+Resume restores the saved settings and continues from the last checkpoint. History beyond that checkpoint is rewound before recording continues. `--checkpoint-every N` changes the interval. **End run** writes final outputs and keeps the viewer open; **Ctrl+C** saves and exits. Checkpoints require a build with compatible state layout and simulation rules.
+
+## The world
+
+| Resource | Effect | Available senses |
+| --- | --- | --- |
+| Food A | Nutritious | Directional cues, contact identity and taste |
+| Food B | Harmful | Directional cues, contact identity and taste |
+| Food C | Inert | Contact identity and taste |
+| Other animals | Can be bitten; lethal bites transfer some remaining energy | Directional presence, pain and meat taste |
+
+Empty cells replenish food independently. Movement, biting, body upkeep and active neurons consume energy. Predators and prey are emergent roles; every animal has the same available senses and motor outputs.
+
+Safety ceilings are **32,768 animals**, **4,194,304 neuron slots**, and **8,388,608 synapse slots**. Death returns brain slots to the global pools. `--population` sets the founding population, and the viewer shows current capacity use.
+
+## Evidence, learning and limits
+
+The neural ingredients are grounded in published recordings and small-circuit experiments: spike responses, sensory relays, dendritic summation, short-term synaptic dynamics, spike-timing plasticity and modulatory eligibility traces. The model combines several fitted cell and synapse phenotypes; it is not an anatomical reconstruction of a particular species.
+
+**Reproducing local neural responses does not establish that the evolving animals learn useful behaviours.** Food-choice and lifetime measurements help investigate that question, but survival, repeated movement, or larger brains alone are not proof of learning or memory.
+
+```sh
 ctest --test-dir build --output-on-failure
-./build/neural_selection --steps 2000 --population 512 --seed 1 --food-renewal 0.0006 --output run.csv
+python3 tests/checkpoint_roundtrip.py ./build/neural_selection
+python3 tools/analyze_behavior.py runs/world.csv
 ```
 
-For a live view, add `--visualize` and open the local address printed by the program (by default, [http://127.0.0.1:8765/](http://127.0.0.1:8765/)):
+See [the experimental reproductions](EXPERIMENTS.md) for protocols, results and remaining gaps, and [the neural model](docs/NEURAL_MODEL.md) for mechanisms and original publications.
 
-```sh
-./build/neural_selection --population 512 --seed 1 --visualize --output run.csv
-```
+## Outputs and further reading
 
-Live runs have no step limit unless you set `--steps N`. `--steps 0` also selects an unlimited run without the browser. The browser view shows the 2D food map and moving, oriented animals, with pulses for births and deaths and orange flashes at exact bite locations, live population and event counts, global animal and brain-slot usage, a population chart, and details for a clicked animal. Drag to pan, scroll to zoom, and use the controls to pause, resume, change speed, or end the run. At 1× the program targets 20 world steps per second; 4× targets 80; Max runs at GPU speed. The page updates every two world steps. End run writes the final image and brain tables and leaves the page open for inspection; Ctrl+C saves and exits. Use `--port N` if port 8765 is occupied. The server listens only on `127.0.0.1`.
+| File | Contents |
+| --- | --- |
+| `<output>` | Population, births, deaths, predation, resources and brain-slot history |
+| `<output>.behavior.csv` | Food-choice and movement measurements |
+| `<output>.lives.csv` | Sampled completed lifetimes |
+| `<output>.checkpoint.gz` | Resumable world state |
+| `<output>.png` | Final world image |
+| `<output>.neurons.csv`, `<output>.synapses.csv` | Final neural genomes and synaptic state |
 
-Selecting an animal opens a live brain view below the world. Neurons are arranged by sensory input, internal network, and motor output, with colors for inhibitory transmission and neuromodulators. Zoom, pan, expand, and hover to inspect voltage, sampled firing rate, and input/output counts. The view uses the actual evolved graph, including recurrent and self connections; decorative branching and positions are schematic. Flashes come from changes in recorded spike counters. Travelling pulses are slowed visual cues for presynaptic firing, rather than exact timing or proof of synaptic release. Only the selected brain is downloaded, and observation never changes neural state.
+[Running, profiling and interpreting behaviour](docs/RUNNING.md) · [Neural model and sources](docs/NEURAL_MODEL.md) · [Experimental reproductions](EXPERIMENTS.md)
 
-Live runs now save an atomic, compressed checkpoint at step 0, every 10,000 world steps, and on a normal stop. It defaults to `<output>.checkpoint.gz`. To continue after a crash, run `./build/neural_selection --resume run.csv.checkpoint.gz --visualize`. The saved world includes living genomes, learned synaptic weights, neuron voltages and other dynamic state, resource and body state, random generators, and world history counters. Resume restores the saved simulation settings and returns to the last completed checkpoint; steps after it are lost. When continuing into the same output files, history rows beyond that step are removed before new rows are appended. Starting a new run refuses to overwrite an existing checkpoint. `--checkpoint-every N` changes the interval; `--checkpoint file.gz` enables checkpointing for a run without the live view or changes the destination. A checkpoint only loads into a build with a matching state layout and compatible simulation rules. The pre-checkpoint live run from September 2026 cannot be resumed from its CSV files.
+## License
 
-Use `--profile` for per-stage timing and sampled delivery, neuron, and plasticity kernel times. It synchronizes the GPU to measure stages, so its throughput includes profiling overhead. `--legacy-neural` retains the original separate delivery and plasticity launches for comparisons; the default pipelines plasticity from one tick with delivery for the next while preserving their order. The modulatory event timestamps use alternating tick slots so a new delivery cannot overwrite the previous tick's event during the combined pass.
-
-`--block-brains` selects an experimental GPU path that advances each eligible animal's brain for all 16 neural ticks in one CUDA block, keeping changing state in shared memory. It uses a small-block tier through 80 allocated neurons and 192 synapses, a medium-block tier through 128 neurons and 256 synapses, and the existing global-slot path above either medium limit. These limits only select execution paths; they do not constrain evolution. On the RTX 3080 with 2,048 founders, the original small tier reduced neural work from about 14.1 to 5.8 ms per world step. In a 112-neuron comparison, the medium tier reduced neural work from 17.8 to 9.6 ms. See [EXPERIMENTS.md](EXPERIMENTS.md) for validation and limits.
-
-`--event-synapses` is a further experimental mode on the block path. It queues spike arrivals and advances plasticity state across quiet intervals without applying its update equations at every neural tick. Neurons still integrate at 1 ms network intervals, so this is a partial event-driven solver. In a matched 2,048-founder benchmark it reduced the neural stage from 6.21 to 5.56 ms per step. It is opt-in while longer-term behavioral equivalence remains unverified.
-
-Architecture `86` targets an RTX 3080; change it for another GPU. On this machine, a temporary CUDA 12.9 toolkit under `/tmp/cuda129` was used to build the existing executable because `nvcc` was not installed system-wide. If that toolkit is gone, rebuilding needs another CUDA Toolkit.
-
-Each world step advances the neural simulation by 16 one-millisecond ticks. The program writes population history to the requested CSV, an image to `<output>.png`, and final genomes and synaptic weights to `<output>.neurons.csv` and `<output>.synapses.csv`. The brain tables include allocated inactive genes, global neuron/synapse slot IDs, fixed port numbers (`-1` means hidden), and heritable sensory-channel assignments. White pixels in the image are animals; green, orange, and blue represent the three food types. Runs with the same seed may differ because animals contend for resources and birth slots through GPU atomics.
-
-## Observing behaviour
-
-The simulation also writes cumulative food-choice and movement measurements to `<output>.behavior.csv` every 100 world steps, plus a 10% deterministic sample of completed lifetimes to `<output>.lives.csv`. The live view shows recent hungry food-choice rates. Summarize an active or finished run with:
-
-```sh
-python3 tools/analyze_behavior.py run.csv
-```
-
-An *opportunity* means an animal starts a step on a stocked food cell; *accepted* means its eat output fires and it successfully harvests that cell. Empty-cell eat attempts are recorded separately to reveal an indiscriminate eat drive. Counts are split by food A/B/C, energy below or at least 16 at the start of the step, and animal age 0–99, 100–299, or 300+ steps. Hungry approach alignment compares movement toward the nearest stocked cell of each type within four cells against distance traveled; +1 is straight toward it, −1 straight away. These observations are never provided to the brain as rewards or fitness signals. A and B have distant directional senses. All three foods have distinct contact chemosensory channels while underfoot, before ingestion; C has no distant cue, so its approach score is a reference. An animal moving onto food senses its identity before it can eat there on the following step. Consumption still produces distinct taste and body-state signals. High acceptance alone is not evidence of selective feeding; compare it with empty-cell attempts and food-specific acceptance.
-
-The history CSV also counts the first 100 world steps of the founding animals: `founder_observed_steps` is the number of living founder animal-steps, and `founder_forward_steps` and the other `founder_*_steps` columns count steps with at least one spike from each motor. The evolving world has no inherited constant-current bias; motor activity must arise from sensory input, synaptic transmission, or intrinsic membrane conductances. Fixed motor port meanings remain unchanged. Earlier runs with inherited motor current are not directly comparable to bias-free runs.
-
-Forward and turning motor spikes drive decaying body-side muscle states with a 200 ms decay time, approximating measured insect body-muscle relaxation. Eat and bite require a spike in the current 16 ms step; they do not inherit that muscle persistence. Muscle states reset at birth and never feed current into a neuron. `--instant-motors` restores the earlier one-step movement rule for comparisons. `--silence-senses` sets external sensory levels to zero for a diagnostic run; olfactory receptor neurons retain their measured spontaneous baseline. `--silence-contact` disables only the three pre-ingestion food contact channels. These flags do not change the genome or add a neural bias. The first-100-step founder counters still count motor spikes, not muscle activity.
-
-The lifetime sample records age at death, cause (1 predation, 2 energy depletion, 3 other health loss, 4 age limit), offspring count, brain size, modulatory and plastic synapse counts, synaptic weight change, and the same food-choice counters. It supports comparisons within the same animal and across brain types. Such associations can suggest adaptation, but age, survival selection, and genotype differences can mimic learning; they do not by themselves prove it.
-
-With inherited constant current first removed, the earlier `--steps 5000 --population 2048 --seed 1` configuration produced no motor spikes or births. All founders died by step 3,800. In a matching 2,000-step trial, all 12,288 active food receptor neurons fired, and 22,563 active hidden neurons fired, but none of the 10,240 motor neurons did. This was a sensory-to-motor propagation gap in that earlier founder configuration; later physiology, genome and muscle changes are described in [EXPERIMENTS.md](EXPERIMENTS.md).
-
-To inspect one founding animal's motor inputs, add `--trace-animal N` with a founder slot number from `0` through `population - 1`. The run writes `<output>.trace.csv` with excitatory and inhibitory synapse arrivals, released conductance, maximum motor voltage, and motor spikes. Choose a run that ends before that founder dies, since slots can be reused after death.
-
-## Ecology
-
-There are no fixed predator and prey species. Every animal can detect other animals in three directions and has a separate neural bite output. A bite costs energy, injures a co-located animal, and gives that animal a pain signal. A lethal bite transfers 45% of the prey's remaining energy to the attacker and activates a meat-taste signal. Predation therefore transfers existing energy rather than adding a reward signal. Whether animals hunt or avoid others depends on their evolving circuits.
-
-Each active neuron costs 0.00002 energy per world step, one tenth of the previous rate, in addition to a 0.003 body upkeep cost and the costs of movement and biting. These are ecological calibration parameters, not fitted neuronal metabolism. At 45 active neurons, idle upkeep is 0.0039 energy per step; larger brains still cost more, but the selective pressure to shrink them is weaker.
-
-Food renews independently in each empty cell with probability 0.0006 per world step by default; `--food-renewal` changes that probability. The history CSV includes population, births, total deaths, predation deaths, bites, and stocked food cells. With the shared-pool brain layout, a 10,000-step run before deletion mutations and the latest upkeep reduction started at 512 animals, ended with 413, and never reached the 2,048-slot safety ceiling. This is an earlier empirical calibration, not a guaranteed equilibrium for the current settings.
-
-## Neural model
-
-- Each active neuron has a membrane voltage, adaptation current, and excitatory and inhibitory conductances. It emits discrete spikes. The adaptive exponential integrate-and-fire equations and two parameter sets come from fits to recorded cortical neurons in [Naud et al. (2008)](https://lcnwww.epfl.ch/gerstner/PUBLICATIONS/Naud08.pdf). The default pyramidal profile also has an inherited, mutable spike aftercurrent fitted to cortical afterpotentials reported by [Haj-Dahmane and Andrade (1997)](https://journals.physiology.org/doi/10.1152/jn.1997.78.4.1983) and the 40 Hz residual voltage in [Sjöström et al. (2001)](https://plasticity.muhc.mcgill.ca/DataPage/PDFs/Sjostrom_Neuron_2001.pdf). Four 0.25 ms integration substeps are used per neural tick.
-- A rare, optional hidden-neuron phenotype uses the fitted two-compartment conductance equations for an isolated lobster lateral pyloric cell from [Nowotny et al. (2008)](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0002627). It includes calcium, calcium-dependent potassium, h, A, M, fast sodium, and delayed-rectifier potassium currents. Its channel densities can mutate, and it imposes no network layout. The protocol comparison and limits are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
-- Another optional hidden-neuron phenotype uses the eight-current crab pyloric pacemaker model from [Prinz et al. (2004)](https://www.nature.com/articles/nn1352). Its channel densities and extra resting leak can mutate. A published [dynamic-clamp experiment](https://www.frontiersin.org/journals/behavioral-neuroscience/articles/10.3389/fnbeh.2010.00021/full) motivates our leak intervention checks. The model can reproduce leak-dependent pacemaker bursting, but we have not reproduced the experiment's connected AB–PD–LP network rescue or phase pattern.
-- An Aplysia LFS motor-cell phenotype uses measured passive properties and published threshold-reset and spike-undershoot parameters from [Lieb and Frost (1997)](https://journals.physiology.org/doi/full/10.1152/jn.1997.77.3.1249). Its isolated protocol reproduces spontaneous activity and a qualitative sensory-evoked response without constant-current bias. The high-current shunts and full sensory-to-motor circuit remain outside this partial reproduction.
-- The six distant food-sense channels drive separate ORN-like afferents with independent receptor-current fluctuations and voltage-generated spikes. Receptor activity has experimentally changed spontaneous firing in real ORNs ([Nagel and Wilson, 2011](https://pmc.ncbi.nlm.nih.gov/articles/PMC3030680/)); the event size and timing law here are effective fitted parameters, not a molecular receptor model. Genes can assign additional afferents to any of the 19 fixed sensory values and mutate their connections, without imposing a fixed convergence graph. The remaining 13 channels, including the three contact food receptors, use the existing direct-current transduction. The [single-ORN protocol and limits](EXPERIMENTS.md) are documented separately.
-- Excitatory pyramidal cells route synapses to four mutable dendritic branches. Each branch has a fitted nonlinear input/output curve following the two-site summation pattern measured by [Polsky et al. (2004)](https://neurophysics.ucsd.edu/courses/physics_171/49528.pdf).
-- Excitatory synapses have resource depletion, recovery, inherited facilitation parameters, and a mutable number of stochastic release sites, following paired and multi-cell recordings in [Tsodyks and Markram (1997)](https://www.cns.nyu.edu/csh/csh04/Articles/Tsodyks-Markram-97.pdf) and [Markram et al. (1998)](https://web.stanford.edu/class/cs379c/archive/2016/class_messages_listing/articles/MarkrametalPNAS-98.pdf). Inhibitory synapses add a decaying inhibitory conductance.
-- Excitatory-to-excitatory synapses have source-specific plasticity profiles. One approximates the cultured hippocampal spike-timing protocol in [Bi and Poo (1998)](https://www.gatsby.ucl.ac.uk/~pel/course_wuhan/papers/bi.poo_1998.pdf); the default cortical layer-5 profile also requires preceding depolarization, as measured by [Sjöström et al. (2001)](https://plasticity.muhc.mcgill.ca/DataPage/PDFs/Sjostrom_Neuron_2001.pdf). NMDA blockade can be applied in protocol checks. Neither profile is a universal law of learning.
-- A separate synaptic phenotype can retain short-lived LTP and LTD eligibility traces, converted by locally delivered noradrenaline- or serotonin-like events through matching receptors. This is fitted to the two-pathway recordings of [He et al. (2015)](https://escholarship.org/content/qt290403p6/qt290403p6_noSplash_15961229581c4dab94718b9699f4df0e.pdf). Hidden neurons may inherit and mutate a modulatory transmitter identity; synapses may inherit and mutate receptors and plasticity phenotype. No cortical anatomy is imposed on evolving brains.
-- Another mutable synaptic phenotype has delayed dopamine sensitivity and competing depression, fitted to the cell-specific timing and blocker controls in [Shindou et al. (2019)](https://onlinelibrary.wiley.com/doi/10.1111/ejn.13921). This adds no required striatal layout; its eligibility time course is phenomenological.
-- An optional synapse phenotype tracks local dopamine-dependent spine enlargement with the timing and inhibitor controls of [Yagishita et al. (2014)](https://pubmed.ncbi.nlm.nih.gov/25258080/). This structural state is exported for inspection but does not yet change synaptic transmission or animal behaviour.
-- Excitatory pyramidal cells also have a slow postsynaptic AMPA scale shared by their excitatory inputs. Its 48-hour endpoint response is calibrated to [Turrigiano et al. (1998)](https://faculty.washington.edu/somurray/psych545/Turrigiano_Nature_1998.pdf). It changes negligibly in the short world runs shown here.
-- The heritable genome stores initial neuron parameters, cell types, topology, connection strength, delays, and synaptic release parameters. Mutation can add, silence, or remove hidden neurons and synapses and alter their parameters. Removing a hidden neuron also removes its connections and returns those slots to the shared pools; fixed sensory and motor ports remain. Learning changes current synaptic weights; newborns start from inherited initial strengths, with no inherited lifetime neural state.
-- A fast transmitter sign is inherited separately from membrane phenotype. The published cell profiles still supply their original default signs, while mutation can change a hidden cell's fast transmitter without replacing its spike-generating model. Modulatory identity remains a separate inherited field.
-
-The body has 19 fixed sensory values and five fixed motor ports. Channels 0–5 encode directional distant cues for A/B; 6–8 hunger, fullness, and pain; 9–11 post-ingestion taste; 12–14 nearby animals; 15 meat taste; and 16–18 contact identity for A/B/C. Contact identity has no built-in good or bad value. A heritable `sensory_channel` lets multiple neurons read the same sensory value while keeping independent spiking state. New animals currently begin with 48 additional hidden neuron genes and 180 synapse genes. Hidden and motor genes independently vary membrane phenotype and a heritable `target_affinity` that biases how often new random synapses target them; affinity specifies no fixed food choice or action circuit. Births and mutations allocate from **shared pools of 4,194,304 neuron and 8,388,608 synapse slots**. There is no fixed neuron or synapse allotment per animal: a larger brain consumes more of the global budget, and death returns its slots for reuse. The history CSV reports total allocated slots and the largest individual genomes. The animal-slot ceiling is 32,768, sixteen times the previous ceiling. `--population` selects the initial number of animals, not this ceiling.
-
-A 2,000-step GPU run with deletion mutations completed with 1,385 births. It checked global occupied-slot counts against the sum of living genomes every 100 steps. Final genomes ranged from 67 to 72 neuron slots and 110 to 129 synapse slots, and every exported synapse referenced a neuron belonging to the same animal. All 21 fixed ports remained present in every animal. This verifies growth, deletion, and slot recycling in that run; it does not imply those brains learned useful behaviour.
-
-## Evidence and limits
-
-[EXPERIMENTS.md](EXPERIMENTS.md) lists the original experimental protocols, our results, what was fitted versus checked, and remaining gaps. Run all protocol checks with `ctest`. The ORN receptor and sensory-relay checks pass their specified measurements, while full in vivo odor dynamics and the evolving world's acquisition of useful sensory circuits remain unverified.
-
-These checks establish a few local response patterns, not a validated biological brain. In particular, the dendritic branches are phenomenological rather than explicit membranes, and the model omits detailed ion channels, variable quantum size, synapse-specific molecular machinery, development, and molecularly validated sensory transduction. Several neuron fits come from mammalian cortex; plasticity checks draw on cortical, cultured hippocampal, and striatal experiments. None validates an insect brain or complex learned behaviour in the evolving world.
+[MIT](LICENSE). Third-party notices are preserved in [LICENSES](LICENSES/).
