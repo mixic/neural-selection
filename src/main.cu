@@ -143,6 +143,24 @@ struct CheckpointSynapse {
     SynapseState state;
 };
 
+// Observer-only packing of one selected brain; no neural state is modified.
+struct BrainViewNeuron {
+    int slot, port;
+    NeuronGene gene;
+    NeuronState state;
+};
+__global__ void pack_brain_view(Device d, int animal, BrainViewNeuron *neurons,
+                                CheckpointSynapse *synapses) {
+    if (threadIdx.x || blockIdx.x) return;
+    const Animal &body = d.animals[animal];
+    int i = 0;
+    for (int n = body.neuron_head; n >= 0; n = d.neuron_next[n])
+        neurons[i++] = {n, d.neuron_port[n], d.neurons[n], d.neuron_state[n]};
+    i = 0;
+    for (int n = body.synapse_head; n >= 0; n = d.synapse_next[n])
+        synapses[i++] = {n, animal, d.synapse_next[n], d.synapses[n], d.synapse_state[n]};
+}
+
 __global__ void pack_checkpoint_neurons(Device d, const int *slots, int count,
                                         CheckpointNeuron *packed) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2185,6 +2203,12 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> neuron_used, synapse_used;
     double live_count_ms = 0, live_download_ms = 0, live_format_ms = 0;
     int64_t live_profile_reports = 0;
+    BrainViewNeuron *view_neurons = nullptr;
+    CheckpointSynapse *view_synapses = nullptr;
+    int view_neuron_capacity = 0, view_synapse_capacity = 0;
+    int published_selection = -1;
+    std::vector<BrainViewNeuron> brain_neurons;
+    std::vector<CheckpointSynapse> brain_synapses;
     auto report = [&](int64_t step, bool log) {
         auto phase_begin = std::chrono::steady_clock::now();
         count_brains<<<(P + 127) / 128, 128>>>(d);
@@ -2365,7 +2389,56 @@ int main(int argc, char **argv) {
             json << "],\"food\":\"";
             for (int c = 0; c < W * H; ++c)
                 json << (food[c] > 0 ? char('1' + kind[c]) : '0');
-            json << "\"}";
+            json << "\",\"brain\":";
+            const int selected = live->selected_animal();
+            published_selection = selected;
+            int selected_slot = -1;
+            for (int a = 0; a < P; ++a)
+                if (bodies[a].alive == 1 && bodies[a].id == selected) {
+                    selected_slot = a; break;
+                }
+            if (selected_slot < 0) {
+                json << "null";
+            } else {
+                const Animal &body = bodies[selected_slot];
+                if (body.neuron_count > view_neuron_capacity) {
+                    if (view_neurons) check(cudaFree(view_neurons), "free brain view");
+                    view_neuron_capacity = body.neuron_count;
+                    allocate(view_neurons, view_neuron_capacity);
+                }
+                if (body.synapse_count > view_synapse_capacity) {
+                    if (view_synapses) check(cudaFree(view_synapses), "free brain view");
+                    view_synapse_capacity = body.synapse_count;
+                    allocate(view_synapses, view_synapse_capacity);
+                }
+                pack_brain_view<<<1, 1>>>(d, selected_slot, view_neurons, view_synapses);
+                download(brain_neurons, view_neurons, body.neuron_count);
+                download(brain_synapses, view_synapses, body.synapse_count);
+                json << "{\"id\":" << selected << ",\"step\":" << step
+                     << ",\"neurons\":[";
+                bool first_neuron = true;
+                for (const auto &n : brain_neurons) {
+                    if (!first_neuron) json << ',';
+                    first_neuron = false;
+                    json << '[' << n.slot << ',' << n.port << ','
+                         << int(n.gene.sensory_channel) << ',' << int(n.gene.type)
+                         << ',' << int(n.gene.active) << ',' << int(n.gene.inhibitory_transmitter)
+                         << ',' << int(n.gene.modulator) << ',' << n.state.voltage_mv
+                         << ',' << n.state.total_spikes << ',' << int(n.state.spike) << ']';
+                }
+                json << "],\"synapses\":[";
+                bool first_synapse = true;
+                for (const auto &n : brain_synapses) {
+                    if (!first_synapse) json << ',';
+                    first_synapse = false;
+                    json << '[' << n.slot << ',' << n.gene.pre << ',' << n.gene.post
+                         << ',' << int(n.gene.active) << ',' << n.state.weight_ns
+                         << ',' << int(n.gene.delay) << ',' << int(n.gene.branch)
+                         << ',' << int(n.gene.plasticity) << ',' << int(n.gene.mod_receptors) << ']';
+                }
+                json << "]}";
+            }
+            json << '}';
             live->publish(json.str());
         }
         if (profile && live && !log) {
@@ -2430,8 +2503,10 @@ int main(int argc, char **argv) {
     for (int64_t step = last_step + 1; steps == 0 || step <= steps; ++step) {
         if (interrupted || (live && live->stop_requested())) break;
         if (live) {
-            while (live->paused() && !live->stop_requested() && !interrupted)
+            while (live->paused() && !live->stop_requested() && !interrupted) {
+                if (live->selected_animal() != published_selection) report(last_step, false);
                 std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
             if (live->stop_requested() || interrupted) break;
         }
         auto frame_start = std::chrono::steady_clock::now();

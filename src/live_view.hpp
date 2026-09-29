@@ -19,6 +19,7 @@ public:
     bool paused() const { return paused_.load(); }
     bool stop_requested() const { return stop_requested_.load(); }
     int speed() const { return speed_.load(); }
+    int selected_animal() const { return selected_animal_.load(); }
 
 private:
     void serve();
@@ -32,6 +33,7 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> finished_{false};
     std::atomic<int> speed_{1};
+    std::atomic<int> selected_animal_{-1};
 };
 
 } // namespace sim

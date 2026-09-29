@@ -262,6 +262,7 @@ function updateUI(data) {
     ? `Eat attempts on empty cells: ${(empty[0] / empty[1] * 100).toFixed(1)}%`
     : 'Eat attempts on empty cells: —';
   updateInspector();
+  brainView.update(data.brain, selectedId, data.paused || data.finished);
 }
 
 async function poll() {
@@ -350,7 +351,7 @@ canvas.addEventListener('pointermove', event => {
 canvas.addEventListener('pointerup', event => {
   if (drag && !drag.moved) {
     const animal = nearestAnimal(event.offsetX, event.offsetY);
-    if (animal) { selectedId = animal[0]; lastKnown = animal; updateInspector(); }
+    if (animal) { selectedId = animal[0]; lastKnown = animal; updateInspector(); brainView.select(selectedId); control(`/api/brain/${selectedId}`); }
   }
   drag = null;
   wrap.classList.remove('dragging');

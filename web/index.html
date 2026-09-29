@@ -23,11 +23,20 @@
     </header>
 
     <main class="layout">
+      <div class="world-column">
       <section class="map-panel">
         <div class="panel-head"><div><span class="eyebrow">01 / ENVIRONMENT</span><h1>The living world</h1><p>Follow movement, feeding, reproduction and loss as they happen.</p></div><div class="map-actions"><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="reset" title="Reset view">Fit</button></div></div>
         <div id="map-wrap" class="map-wrap"><canvas id="world" aria-label="Live map of animals and food"></canvas><div class="map-corner top-left">128 × 128 CELLS</div><div class="map-corner bottom-left">SCROLL TO ZOOM · DRAG TO PAN · CLICK AN ANIMAL</div><div id="hover" class="hover" hidden></div></div>
         <div class="legend"><span><i class="legend-dot animal"></i>Animal</span><span><i class="legend-dot selected"></i>Selected</span><span><i class="legend-dot birth"></i>Birth</span><span><i class="legend-dot death"></i>Death</span><span id="bite-legend" hidden><i class="legend-dot bite"></i>Bite</span><span class="legend-divider"></span><span><i class="legend-dot food-a"></i>Food A</span><span><i class="legend-dot food-b"></i>Food B</span><span><i class="legend-dot food-c"></i>Food C</span></div>
       </section>
+
+      <section class="brain-panel map-panel">
+        <div class="panel-head"><div><span class="eyebrow">NEURAL OBSERVATORY</span><h1 id="brain-title">Inside the brain</h1><p id="brain-summary">Select an animal to explore its living network.</p></div><div class="map-actions"><button id="brain-fit">Fit</button><button id="brain-expand" aria-label="Expand brain view">Expand</button></div></div>
+        <div class="brain-wrap"><canvas id="brain" aria-label="Selected animal neural connections and recorded firing activity"></canvas><div id="brain-empty" class="brain-empty">◎<p>Click an animal on the world map</p></div><div id="brain-hover" class="hover" hidden></div><div class="map-corner bottom-left">SCROLL TO ZOOM · DRAG TO PAN · HOVER A NEURON</div></div>
+        <div class="legend"><span><i class="legend-dot" style="background:#8dcfc4"></i>Sensory</span><span><i class="legend-dot" style="background:#c9e870"></i>Motor</span><span><i class="legend-dot" style="background:#72a6d6"></i>Excitatory</span><span><i class="legend-dot" style="background:#ef847c"></i>Inhibitory</span><span><i class="legend-dot" style="background:#c39bef"></i>Modulator</span><span><i class="legend-dot" style="background:#fff4d4"></i>Recorded firing</span></div>
+        <p class="brain-note">Schematic positions and branches. Flashes show spikes counted between snapshots; travelling pulses are slowed for visibility and do not represent exact spike timing or successful synaptic release. Hover for voltage, role and firing rate.</p>
+      </section>
+      </div>
 
       <aside class="sidebar">
         <section class="capacity card">
@@ -44,6 +53,7 @@
     </main>
     <footer><span>WORLD DATA UPDATES WHILE THE SIMULATION RUNS</span><span>16 NEURAL TICKS / WORLD STEP</span></footer>
   </div>
+  <script src="/brain.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

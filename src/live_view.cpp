@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -110,6 +111,17 @@ void LiveView::handle_client(int client) {
                     ",\"finished\":" + std::string(finished_ ? "true" : "false") +
                     ",\"speed\":" + std::to_string(speed_) + "}";
         send_response(client, 200, "application/json; charset=utf-8", snapshot);
+    } else if (line.rfind("POST /api/brain/", 0) == 0 &&
+               std::strstr(request, "X-Live-View: 1")) {
+        const size_t start = 16;
+        const size_t end = line.find(' ', start);
+        int id = -1;
+        auto parsed = std::from_chars(line.data() + start, line.data() + end, id);
+        if (parsed.ec != std::errc() || parsed.ptr != line.data() + end || id < -1) {
+            send_response(client, 404, "text/plain", "Invalid animal"); return;
+        }
+        selected_animal_ = id;
+        send_response(client, 200, "application/json", "{}");
     } else if (line == "POST /api/pause HTTP/1.1" &&
                std::strstr(request, "X-Live-View: 1")) {
         paused_ = !paused_;
@@ -132,6 +144,8 @@ void LiveView::handle_client(int client) {
         send_response(client, 200, "text/css; charset=utf-8", asset("style.css"));
     } else if (line == "GET /behavior.css HTTP/1.1") {
         send_response(client, 200, "text/css; charset=utf-8", asset("behavior.css"));
+    } else if (line == "GET /brain.js HTTP/1.1") {
+        send_response(client, 200, "text/javascript; charset=utf-8", asset("brain.js"));
     } else if (line == "GET /app.js HTTP/1.1") {
         send_response(client, 200, "text/javascript; charset=utf-8", asset("app.js"));
     } else {
