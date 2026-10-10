@@ -1,0 +1,20 @@
+{
+  "founders": {
+    "inference": {
+      "cpu_seconds": 1.0930611130024772,
+      "cuda_seconds": 0.03399403499861364,
+      "cuda_setup_seconds": 0.23090198800127837,
+      "speedup_vs_single_cpu": 32.15449748895813,
+      "brain_actions": 2560
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 1.0993658589977713,
+      "cuda_seconds": 1.3667756340000778,
+      "speedup": 0.804349910585038,
+      "identical_returns": true,
+      "cpu_steps": 12447,
+      "cuda_steps": 12447
+    }
+  }
+}

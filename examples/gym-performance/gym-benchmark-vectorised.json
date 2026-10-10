@@ -1,0 +1,56 @@
+{
+  "champion": {
+    "inference": {
+      "cpu_seconds": 0.20168699000350898,
+      "cuda_seconds": 0.029529134997574147,
+      "cuda_setup_seconds": 0.23066536499754875,
+      "speedup_vs_single_cpu": 6.830101525834665,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.8144593030010583,
+      "cuda_seconds": 1.3160021130024688,
+      "speedup": 0.6188890541694216,
+      "identical_returns": true,
+      "cpu_steps": 128000,
+      "cuda_steps": 128000
+    }
+  },
+  "hidden64": {
+    "inference": {
+      "cpu_seconds": 2.184812035997311,
+      "cuda_seconds": 0.060745026999939,
+      "cuda_setup_seconds": 0.06527197499963222,
+      "speedup_vs_single_cpu": 35.966928387397125,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.09983713700057706,
+      "cuda_seconds": 0.12639594500069506,
+      "speedup": 0.7898761071807172,
+      "identical_returns": true,
+      "cpu_steps": 3102,
+      "cuda_steps": 3102
+    }
+  },
+  "hidden256": {
+    "inference": {
+      "cpu_seconds": 7.962931187001232,
+      "cuda_seconds": 0.2760069720025058,
+      "cuda_setup_seconds": 0.11897894100184203,
+      "speedup_vs_single_cpu": 28.850471164652095,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.30712676199982525,
+      "cuda_seconds": 0.2901079639996169,
+      "speedup": 1.0586636704679737,
+      "identical_returns": false,
+      "cpu_steps": 3239,
+      "cuda_steps": 3228
+    }
+  }
+}

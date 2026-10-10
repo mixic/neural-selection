@@ -1,0 +1,56 @@
+{
+  "champion": {
+    "inference": {
+      "cpu_seconds": 0.19924881300175912,
+      "cuda_seconds": 0.029389561001153197,
+      "cuda_setup_seconds": 0.23601892899750965,
+      "speedup_vs_single_cpu": 6.77957772128481,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.7982593350025127,
+      "cuda_seconds": 2.6930836079991423,
+      "speedup": 0.29641089962134104,
+      "identical_returns": true,
+      "cpu_steps": 128000,
+      "cuda_steps": 128000
+    }
+  },
+  "hidden64": {
+    "inference": {
+      "cpu_seconds": 2.3263673599976755,
+      "cuda_seconds": 0.06047972500164178,
+      "cuda_setup_seconds": 0.043581038000411354,
+      "speedup_vs_single_cpu": 38.465243681821036,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.10634274300173274,
+      "cuda_seconds": 0.15891231700152275,
+      "speedup": 0.669191318887596,
+      "identical_returns": true,
+      "cpu_steps": 3102,
+      "cuda_steps": 3102
+    }
+  },
+  "hidden256": {
+    "inference": {
+      "cpu_seconds": 7.969424955997965,
+      "cuda_seconds": 0.2642384470018442,
+      "cuda_setup_seconds": 0.12215274999834946,
+      "speedup_vs_single_cpu": 30.159975001451414,
+      "brain_actions": 12800
+    },
+    "evaluation": {
+      "cpu_workers": 8,
+      "cpu_seconds": 0.31038830499892356,
+      "cuda_seconds": 0.32044089999908465,
+      "speedup": 0.968628864167496,
+      "identical_returns": false,
+      "cpu_steps": 3239,
+      "cuda_steps": 3228
+    }
+  }
+}

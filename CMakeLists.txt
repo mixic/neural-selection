@@ -41,3 +41,15 @@ add_test(NAME sensory_relay_protocols COMMAND sensory_relay_protocols)
 add_test(NAME orn_receptor_protocols COMMAND orn_receptor_protocols)
 add_test(NAME aplysia_lfs_protocols COMMAND aplysia_lfs_protocols)
 add_test(NAME event_synapses COMMAND event_synapses)
+
+# Optional Gymnasium bridge also builds directly with g++ (no CUDA needed).
+add_library(gym_brain SHARED gym_adapter/native.cpp)
+target_include_directories(gym_brain PRIVATE src)
+
+option(BUILD_GYM_CUDA "Build the optional batched Gymnasium CUDA bridge" OFF)
+if(BUILD_GYM_CUDA)
+  add_library(gym_brain_gpu SHARED gym_adapter/gpu.cu)
+  target_include_directories(gym_brain_gpu PRIVATE src)
+  target_compile_options(gym_brain_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true>)
+  set_target_properties(gym_brain_gpu PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+endif()

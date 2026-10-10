@@ -100,6 +100,16 @@ python3 tools/analyze_behavior.py runs/world.csv
 
 See [the experimental reproductions](EXPERIMENTS.md) for protocols, results and remaining gaps, and [the neural model](docs/NEURAL_MODEL.md) for mechanisms and original publications.
 
+## Evolve policies for Gymnasium
+
+A separate adapter uses the same physiological C++ core to evolve genomes by environment episode return. It supports flattened observations, discrete actions and bounded continuous actions, with episode resets and held-out evaluation. The adapter supports CPU workers and batched CUDA brains with parallel environment workers, including MiniGrid’s partial observations.
+
+The first CartPole experiment evolved a brain averaging **426.0 / 500** on 100 unseen episodes, compared with **104.4** for the best initial candidate and **22.7** for random actions. This measures evolutionary policy improvement, not learning within a lifetime.
+
+![Evolved spiking brain balancing CartPole](examples/gym-cartpole/rollout.gif)
+
+See [the Gymnasium adapter guide](docs/GYMNASIUM.md) for setup, observation encoding, training and replay, and [the saved experiment](examples/gym-cartpole/README.md) for the champion and test results. The [environment suite](examples/gym-suite/README.md) includes MiniGrid navigation and memory, Pendulum, Acrobot and MountainCar with replays and held-out results; [performance measurements](docs/GYM_PERFORMANCE.md) explain the CPU and CUDA tradeoffs.
+
 ## Outputs and further reading
 
 | File | Contents |
