@@ -126,3 +126,9 @@ See [the Gymnasium adapter guide](docs/GYMNASIUM.md) for setup, observation enco
 ## License
 
 [MIT](LICENSE). Third-party notices are preserved in [LICENSES](LICENSES/).
+
+## Testing the benefit of ongoing plasticity
+
+[Randomized continuation experiments](docs/PLASTICITY_CONTINUATION.md) freeze
+long-term plasticity in some existing animals and compare their survival and
+additional offspring with untreated animals across repeated saved-world trials.

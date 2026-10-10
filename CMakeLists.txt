@@ -53,3 +53,9 @@ if(BUILD_GYM_CUDA)
   target_compile_options(gym_brain_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true>)
   set_target_properties(gym_brain_gpu PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endif()
+
+add_executable(plasticity_ablation_protocols tests/plasticity_ablation.cu src/live_view.cpp)
+target_compile_options(plasticity_ablation_protocols PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+target_compile_definitions(plasticity_ablation_protocols PRIVATE LIVE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
+target_link_libraries(plasticity_ablation_protocols PRIVATE PNG::PNG z Threads::Threads)
+# GPU tests are invoked explicitly, allowing CPU-only ctest runs.

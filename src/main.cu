@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -92,6 +93,15 @@ struct BiteEvent {
     int attacker_id, prey_id;
     float x, y;
 };
+// Experimental intervention is separate from the heritable genome and body.
+// One record per original slot; the id guard prevents transfer to slot occupants.
+struct PlasticityCohort {
+    int id, assigned, frozen, initial_age, initial_offspring;
+    int final_age, final_offspring, alive, death_cause;
+    int neurons, synapses, generation;
+    float initial_energy, initial_health;
+    int64_t start_step, observed_step, death_step;
+};
 struct Device {
     int initial_count;
     int trace_animal;
@@ -99,6 +109,7 @@ struct Device {
     bool silence_contact;
     bool instant_motors;
     Animal *animals;
+    PlasticityCohort *plasticity_cohort;
     NeuronGene *neurons;
     SynapseGene *synapses;
     NeuronState *neuron_state;
@@ -127,6 +138,28 @@ struct Device {
     BiteEvent *bite_events;
     int *bite_event_count;
 };
+
+__device__ inline bool plasticity_frozen(Device d, int a) {
+    return d.plasticity_cohort && a >= 0 &&
+        d.plasticity_cohort[a].assigned && d.plasticity_cohort[a].frozen &&
+        d.plasticity_cohort[a].id == d.animals[a].id;
+}
+
+__global__ void observe_plasticity_cohort(Device d, int64_t step) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= P || !d.plasticity_cohort) return;
+    PlasticityCohort &r = d.plasticity_cohort[a];
+    Animal body = d.animals[a];
+    if (!r.assigned || r.id != body.id || r.death_step >= 0) return;
+    r.final_age = body.age;
+    r.final_offspring = body.behavior.offspring;
+    r.alive = body.alive == 1;
+    r.observed_step = step;
+    if (!r.alive) {
+        r.death_step = step;
+        r.death_cause = body.behavior.death_cause;
+    }
+}
 
 struct CheckpointNeuron {
     int slot, owner, next, port;
@@ -714,6 +747,7 @@ __global__ void neuron_step(Device d, int64_t tick, int occupied_count) {
 
 __device__ inline void plasticity_synapse(Device d, const SynapseGene &g,
                                           SynapseState &s, int64_t tick) {
+    if (plasticity_frozen(d, d.neuron_owner[g.post])) return;
     bool excitatory_pair = !d.neurons[g.pre].inhibitory_transmitter &&
         excitatory_type(d.neurons[g.pre].type) &&
         d.neurons[g.pre].modulator == 0 &&
@@ -884,7 +918,7 @@ __global__ void brain_block_step(Device d, const int *animal_slots,
             if (brain.edge_active[e]) {
                 NeuronGene source = d.neurons[brain.neuron_ids[pre]];
                 NeuronGene target = d.neurons[brain.neuron_ids[post]];
-                brain.plastic_pair[e] = g.plasticity &&
+                brain.plastic_pair[e] = !plasticity_frozen(d, a) && g.plasticity &&
                     !source.inhibitory_transmitter &&
                     excitatory_type(source.type) && source.modulator == 0 &&
                     !target.inhibitory_transmitter && excitatory_type(target.type);
@@ -1029,7 +1063,7 @@ __global__ void brain_block_step(Device d, const int *animal_slots,
                 SynapseGene g = d.synapses[brain.synapse_ids[e]];
                 synapse_plasticity_quiet(g, state,
                     t - brain.last_plasticity[e] - 1);
-                synapse_plasticity_step(g, state, state.arrived,
+                if (!plasticity_frozen(d, a)) synapse_plasticity_step(g, state, state.arrived,
                     brain.neuron_state[post].spike, true,
                     brain.neuron_state[post].recent_depol_mv, true,
                     static_cast<unsigned char>(brain.mod_bits[post]));
@@ -1046,7 +1080,7 @@ __global__ void brain_block_step(Device d, const int *animal_slots,
             bool excitatory_pair = !source.inhibitory_transmitter &&
                 excitatory_type(source.type) && source.modulator == 0 &&
                 !target.inhibitory_transmitter && excitatory_type(target.type);
-            synapse_plasticity_step(g, state, state.arrived,
+            if (!plasticity_frozen(d, a)) synapse_plasticity_step(g, state, state.arrived,
                 brain.neuron_state[post].spike, excitatory_pair,
                 brain.neuron_state[post].recent_depol_mv, true,
                 static_cast<unsigned char>(brain.mod_bits[post]));
@@ -1090,7 +1124,7 @@ __global__ void homeostasis_block_animals(Device d, const int *animal_slots,
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= animal_count) return;
     int a = animal_slots[ordinal];
-    if (d.animals[a].alive != 1) return;
+    if (d.animals[a].alive != 1 || plasticity_frozen(d, a)) return;
     float elapsed_ms = fmaxf(16.0f, d.animals[a].age * 16.0f);
     for (int n = d.animals[a].neuron_head; n >= 0; n = d.neuron_next[n]) {
         if (!d.neurons[n].active) continue;
@@ -1256,7 +1290,8 @@ __global__ void homeostasis_step(Device d, int occupied_count) {
     int i = d.occupied_neurons[ordinal];
     int a = d.neuron_owner[i];
     if (a < 0) return;
-    if (d.animals[a].alive != 1 || !d.neurons[i].active) return;
+    if (d.animals[a].alive != 1 || !d.neurons[i].active ||
+        plasticity_frozen(d, a)) return;
     NeuronState state = d.neuron_state[i];
     float elapsed_ms = fmaxf(16.0f, d.animals[a].age * 16.0f);
     float observed_hz = state.total_spikes * 1000.0f / elapsed_ms;
@@ -1904,7 +1939,10 @@ int main(int argc, char **argv) {
     std::string output = "run.csv";
     std::string checkpoint_path, resume_path;
     bool output_specified = false, interval_specified = false;
-    int64_t checkpoint_every = 10000;
+    int64_t checkpoint_every = 10000, continuation_steps = -1;
+    bool ablation_requested = false;
+    double ablation_fraction = 0.5;
+    unsigned long long ablation_seed = 1;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
             steps = strtoll(argv[++i], nullptr, 10);
@@ -1925,6 +1963,13 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--resume") && i + 1 < argc)
             resume_path = argv[++i];
+        else if (!strcmp(argv[i], "--plasticity-ablation")) ablation_requested = true;
+        else if (!strcmp(argv[i], "--ablation-seed") && i + 1 < argc)
+            ablation_seed = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--ablation-fraction") && i + 1 < argc)
+            ablation_fraction = strtod(argv[++i], nullptr);
+        else if (!strcmp(argv[i], "--continuation-steps") && i + 1 < argc)
+            continuation_steps = strtoll(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--visualize")) visualize = true;
         else if (!strcmp(argv[i], "--profile")) profile = true;
         else if (!strcmp(argv[i], "--legacy-neural")) legacy_neural = true;
@@ -1936,7 +1981,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--silence-senses")) silence_senses = true;
         else if (!strcmp(argv[i], "--silence-contact")) silence_contact = true;
         else if (!strcmp(argv[i], "--instant-motors")) instant_motors = true;
-        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--profile] [--legacy-neural] [--block-brains] [--event-synapses] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors] [--checkpoint file.gz] [--checkpoint-every steps] [--resume file.gz]\n"; return 2; }
+        else { std::cerr << "Usage: neural_selection [--steps N|0] [--population 1..32768] [--seed N] [--food-renewal probability] [--output file.csv] [--visualize] [--profile] [--legacy-neural] [--block-brains] [--event-synapses] [--port 1..65535] [--trace-animal founder_slot] [--silence-senses] [--silence-contact] [--instant-motors] [--checkpoint file.gz] [--checkpoint-every steps] [--resume file.gz] [--continuation-steps N] [--plasticity-ablation] [--ablation-seed N] [--ablation-fraction 0..1]\n"; return 2; }
     }
     gzFile resume_file = nullptr;
     CheckpointHeader resume_header{};
@@ -1968,6 +2013,27 @@ int main(int argc, char **argv) {
         if (!steps_specified) steps = 0;
         if (!interval_specified) checkpoint_every = resume_header.checkpoint_every;
         if (checkpoint_path.empty()) checkpoint_path = resume_path;
+    }
+    const bool restored_ablation = resume_header.flags & 64u;
+    if ((ablation_requested && (resume_path.empty() || restored_ablation ||
+         !output_specified || std::filesystem::exists(output) ||
+         std::filesystem::exists(checkpoint_path) ||
+         std::filesystem::weakly_canonical(output) ==
+         std::filesystem::weakly_canonical(resume_header.output) ||
+         std::filesystem::weakly_canonical(checkpoint_path) ==
+         std::filesystem::weakly_canonical(resume_path))) ||
+        !std::isfinite(ablation_fraction) || ablation_fraction < 0 ||
+        ablation_fraction > 1 || continuation_steps < -1 ||
+        (continuation_steps >= 0 && (continuation_steps == 0 ||
+         steps_specified || resume_path.empty() ||
+         continuation_steps > INT64_MAX / TICKS - resume_header.step))) {
+        std::cerr << "A new ablation needs an ordinary checkpoint and separate output/checkpoint paths. "
+                     "Continuation steps must be positive and cannot accompany --steps.\n";
+        return 2;
+    }
+    if (continuation_steps > 0) {
+        steps = resume_header.step + continuation_steps;
+        steps_specified = true;
     }
     block_brains |= event_synapses;
     if (visualize && !steps_specified) steps = 0;
@@ -2007,6 +2073,10 @@ int main(int argc, char **argv) {
     d.silence_contact = silence_contact;
     d.instant_motors = instant_motors;
     allocate(d.animals, P);
+    if (ablation_requested || restored_ablation) {
+        allocate(d.plasticity_cohort, P);
+        check(cudaMemset(d.plasticity_cohort, 0, P * sizeof(PlasticityCohort)), "cohort init");
+    }
     allocate(d.neurons, NEURON_CAPACITY); allocate(d.synapses, SYNAPSE_CAPACITY);
     allocate(d.neuron_state, NEURON_CAPACITY);
     allocate(d.synapse_state, SYNAPSE_CAPACITY);
@@ -2160,6 +2230,54 @@ int main(int argc, char **argv) {
     index_animals<<<(P + 127) / 128, 128>>>(d);
     if (!resumed) update_senses<<<(P + 127) / 128, 128>>>(d);
     check(cudaDeviceSynchronize(), "initialization");
+    if (ablation_requested) {
+        std::vector<Animal> baseline;
+        download(baseline, d.animals, P);
+        std::vector<int> slots;
+        for (int a = 0; a < P; ++a) if (baseline[a].alive == 1) slots.push_back(a);
+        if (slots.empty()) { std::cerr << "No living animals to randomize\n"; return 2; }
+        std::mt19937_64 assignment_rng(ablation_seed);
+        std::shuffle(slots.begin(), slots.end(), assignment_rng);
+        size_t frozen_count = std::llround(ablation_fraction * slots.size());
+        std::vector<PlasticityCohort> cohort(P);
+        for (size_t j = 0; j < slots.size(); ++j) {
+            int a = slots[j]; const Animal &b = baseline[a];
+            PlasticityCohort &r = cohort[a];
+            r.id = b.id; r.assigned = 1; r.frozen = j < frozen_count;
+            r.initial_age = r.final_age = b.age;
+            r.initial_offspring = r.final_offspring = b.behavior.offspring;
+            r.alive = 1; r.death_step = -1;
+            r.neurons = b.neuron_count; r.synapses = b.synapse_count;
+            r.generation = b.generation;
+            r.initial_energy = b.energy; r.initial_health = b.health;
+            r.start_step = r.observed_step = resume_header.step;
+        }
+        check(cudaMemcpy(d.plasticity_cohort, cohort.data(), P * sizeof(cohort[0]),
+                         cudaMemcpyHostToDevice), "cohort assignment");
+        std::cout << "Plasticity frozen in " << frozen_count << "/" << slots.size()
+                  << " existing animals; assignment seed " << ablation_seed << '\n';
+    }
+    auto write_cohort = [&]() {
+        if (!d.plasticity_cohort) return;
+        std::vector<PlasticityCohort> cohort;
+        download(cohort, d.plasticity_cohort, P);
+        std::string path = output + ".plasticity.csv";
+        std::ofstream out(path + ".tmp");
+        out << "id,frozen,start_step,observed_step,death_step,alive,death_cause,"
+               "initial_age,final_age,initial_offspring,final_offspring,"
+               "neurons,synapses,generation,initial_energy,initial_health\n";
+        for (const auto &r : cohort) if (r.assigned)
+            out << r.id << ',' << r.frozen << ',' << r.start_step << ','
+                << r.observed_step << ',' << r.death_step << ',' << r.alive << ','
+                << r.death_cause << ',' << r.initial_age << ',' << r.final_age << ','
+                << r.initial_offspring << ',' << r.final_offspring << ','
+                << r.neurons << ',' << r.synapses << ',' << r.generation << ','
+                << r.initial_energy << ',' << r.initial_health << '\n';
+        out.close();
+        if (!out) throw std::runtime_error("Cannot write plasticity cohort");
+        std::filesystem::rename(path + ".tmp", path);
+    };
+    write_cohort();
     if (append_logs) {
         try {
             const std::pair<std::string, uint64_t> files[] = {
@@ -2474,7 +2592,8 @@ int main(int argc, char **argv) {
                            (legacy_neural ? 4u : 0u) |
                            (silence_senses ? 8u : 0u) |
                            (silence_contact ? 16u : 0u) |
-                           (instant_motors ? 32u : 0u);
+                           (instant_motors ? 32u : 0u) |
+                           (d.plasticity_cohort ? 64u : 0u);
             header.csv_size = std::filesystem::file_size(output);
             header.behavior_size = std::filesystem::file_size(output + ".behavior.csv");
             header.lives_size = std::filesystem::file_size(output + ".lives.csv");
@@ -2637,8 +2756,12 @@ int main(int argc, char **argv) {
         if (medium_count)
             homeostasis_block_animals<<<(medium_count + 127) / 128, 128>>>(
                 d, d.medium_animals, medium_count);
+        if (d.plasticity_cohort)
+            observe_plasticity_cohort<<<(P + 127) / 128, 128>>>(d, step);
         reclaim_dead_genomes<<<(P + 127) / 128, 128>>>(d, step);
         reproduce<<<(P + 127) / 128, 128>>>(d);
+        if (d.plasticity_cohort)
+            observe_plasticity_cohort<<<(P + 127) / 128, 128>>>(d, step);
         regrow<<<(W * H + 255) / 256, 256>>>(d, step, seed, food_renewal);
         check(cudaMemsetAsync(d.cell_head, 0xff, W * H * sizeof(int)), "spatial reset");
         index_animals<<<(P + 127) / 128, 128>>>(d);
@@ -2651,6 +2774,7 @@ int main(int argc, char **argv) {
         bool log = step % 100 == 0 || checkpoint_due ||
                    (steps > 0 && step == steps);
         if (log || (live && step % 2 == 0)) report(step, log);
+        if (log) write_cohort();
         if (checkpoint_due) save_checkpoint(step);
         if (profile) {
             auto report_end = std::chrono::steady_clock::now();
@@ -2698,6 +2822,7 @@ int main(int argc, char **argv) {
     if (!checkpoint_path.empty() && last_step > 0 &&
         last_step % checkpoint_every != 0)
         save_checkpoint(last_step);
+    write_cohort();
     write_world(output + ".png", d);
     write_brains(output, d);
     if (trace_animal >= 0) {
@@ -2763,4 +2888,6 @@ int main(int argc, char **argv) {
     cudaFree(d.bites); cudaFree(d.next_id);
     cudaFree(d.life_records); cudaFree(d.life_count);
     if (live) { cudaFree(d.bite_events); cudaFree(d.bite_event_count); }
+    if (d.plasticity_cohort) cudaFree(d.plasticity_cohort);
+    return 0;
 }

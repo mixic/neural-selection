@@ -212,6 +212,11 @@ void checkpoint_write_state(gzFile file, Device d, void *selection_temp,
         }
         cudaFree(packed);
     }
+    if (header.flags & 64u) {
+        uint64_t extension[] = {0x4e53504c41535431ull, 1, sizeof(PlasticityCohort), P};
+        checkpoint_write_bytes(file, extension, sizeof(extension));
+        checkpoint_write_gpu(file, d.plasticity_cohort, P);
+    }
 }
 
 void checkpoint_read_state(gzFile file, Device d, const CheckpointHeader &header,
@@ -312,6 +317,14 @@ void checkpoint_read_state(gzFile file, Device d, const CheckpointHeader &header
         }
         cudaFree(packed);
     }
+    if (header.flags & 64u) {
+        uint64_t extension[4];
+        checkpoint_read_bytes(file, extension, sizeof(extension));
+        if (extension[0] != 0x4e53504c41535431ull || extension[1] != 1 ||
+            extension[2] != sizeof(PlasticityCohort) || extension[3] != P)
+            throw std::runtime_error("Incompatible plasticity intervention extension");
+        checkpoint_read_gpu(file, d.plasticity_cohort, P);
+    }
     unsigned char extra;
     if (gzread(file, &extra, 1) != 0)
         throw std::runtime_error("Unexpected trailing checkpoint data");
@@ -327,7 +340,7 @@ void checkpoint_validate_header(const CheckpointHeader &header) {
         header.checkpoint_every <= 0 ||
         header.initial < 1 || header.initial > P ||
         header.trace_animal < -1 || header.trace_animal >= header.initial ||
-        (header.flags & ~63u) != 0 ||
+        (header.flags & ~127u) != 0 ||
         !std::isfinite(header.food_renewal) ||
         header.food_renewal < 0 || header.food_renewal > 1 ||
         header.neuron_count > NEURON_CAPACITY ||
