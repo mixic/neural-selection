@@ -53,6 +53,13 @@ The default runner is sequential and does not stop existing runs.
 
 ## Outcomes and interpretation
 
+Population fluctuations or predator–prey cycles are not, by themselves, a
+failure of the simulation: the maintainer reports population dynamics in the
+rough range of 400–2,000 in their own runs. This experiment is not intended to
+stabilize population or classify ordinary ecological cycles as a defect. It
+asks the narrower question of whether ongoing plasticity changes outcomes
+conditional on the saved world and randomized assignment.
+
 For the original cohort, we record:
 
 - Survival at the end of the common follow-up horizon and death cause.
@@ -63,6 +70,11 @@ For the original cohort, we record:
 All cohort animals are recorded, even those omitted from the ordinary sampled
 lifespan CSV. Deaths are captured before their slots are reclaimed; surviving
 parents' offspring counts are captured after births.
+
+Death causes are already recorded in the history/lifetime outputs. The
+continuation cohort also records each assigned animal's death cause. Reuse
+these measurements to interpret outcomes; this experiment does not add a
+duplicate death-cause mechanism.
 
 The summary reports frozen minus control differences. Negative values indicate
 worse survival or reproduction with frozen plasticity. It also reports a
@@ -77,6 +89,15 @@ not an isolated-animal effect. A disadvantage would support the usefulness of
 ongoing plasticity; it would not by itself prove a specific learned behavior
 or memory mechanism. A null result can reflect insensitive conditions or
 already adequate inherited/previously learned circuits.
+
+The current world is a proof of concept, and it is not established that its
+ecology creates enough selection pressure for memory or learning to evolve.
+Interpret a null result within that limitation. Separately testing evolved
+brains in tasks that strictly require memory, such as suitable Gymnasium or
+MiniGrid environments, can probe a complementary question; success or failure
+there should not be conflated with this within-world plasticity experiment.
+The limited neighbor senses also make coordinated hunting or alliances a
+separate, more speculative extension, not an assumption of this experiment.
 
 ## Offline symbolic regression
 
