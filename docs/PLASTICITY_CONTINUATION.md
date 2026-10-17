@@ -78,6 +78,47 @@ ongoing plasticity; it would not by itself prove a specific learned behavior
 or memory mechanism. A null result can reflect insensitive conditions or
 already adequate inherited/previously learned circuits.
 
+## Offline symbolic regression
+
+The repeated-trial runner records complete per-animal cohort outcomes, including
+the randomized treatment, baseline age, energy, health and brain size, survival,
+post-assignment offspring, and death cause. Death-cause data already exists in
+the cohort records; this analysis does not add a new death-cause measure.
+
+After installing PySR in a Python environment (`python -m pip install pysr`),
+fit an exploratory survival model and evaluate it on an entire starting world
+that was not used for fitting:
+
+```bash
+python3 tools/analyze_plasticity.py runs/plasticity-comparison/results.json \
+  --held-out-world 2 \
+  --target survival \
+  --output runs/plasticity-comparison/pysr-survival.json
+```
+
+Repeat `--held-out-world N` for each world reserved for evaluation. World
+indices correspond to the zero-based order of `--checkpoint` arguments passed
+to the continuation runner; use independently evolved starting worlds. The
+analyzer requires at least two training worlds and one held-out world, and
+refuses incomplete trial batches. It pools repeated
+random assignments for each original animal and treatment within a starting
+world; animals are not treated as independent experimental replicates. The
+default target is end-of-follow-up survival probability; `--target offspring`
+instead models post-assignment additional offspring. Input columns and the
+selected symbolic equation are listed in the JSON report.
+
+The model is fit offline, never loaded by animal brains. Held-out-world
+prediction tests whether a fitted association transfers to separate starting
+worlds. It does not establish a causal effect, prove a learning mechanism, or
+test H2's specific prediction that behavior changes after predator encounters.
+The current cohort records outcomes but not encounter-aligned before/after
+behavior for each animal. A direct H2 test still needs those event-level
+measurements, a matched plasticity-disabled control, and comparison of
+post-encounter avoidance behavior and bite risk. See
+[issue #1](https://github.com/sinking-point/neural-selection/issues/1) for the
+original hypotheses and [issue #2](https://github.com/sinking-point/neural-selection/issues/2)
+for the H2-first experimental proposal.
+
 ## Single continuation and interruption recovery
 
 ```bash
@@ -111,6 +152,7 @@ does not automatically restart or rerandomize it.
 build/plasticity_ablation_protocols
 python3 tests/plasticity_continuation.py build/neural_selection
 python3 tests/checkpoint_roundtrip.py build/neural_selection
+python3 -m unittest discover -s tests -p test_analyze_plasticity.py
 ```
 
 GPU checks exercise real learning and release functions, homeostatic scaling,

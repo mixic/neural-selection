@@ -100,6 +100,13 @@ python3 tools/analyze_behavior.py runs/world.csv
 
 See [the experimental reproductions](EXPERIMENTS.md) for protocols, results and remaining gaps, and [the neural model](docs/NEURAL_MODEL.md) for mechanisms and original publications.
 
+The [plasticity-continuation experiment](docs/PLASTICITY_CONTINUATION.md) compares
+ongoing plasticity with a randomized frozen-plasticity control. Its optional
+[PySR analysis](docs/PLASTICITY_CONTINUATION.md#offline-symbolic-regression)
+fits offline models to completed cohort outcomes and evaluates them on held-out
+starting worlds; it is exploratory prediction, not evidence of causation or
+predator-encounter learning.
+
 ## Evolve policies for Gymnasium
 
 A separate adapter uses the same physiological C++ core to evolve genomes by environment episode return. It supports flattened observations, discrete actions and bounded continuous actions, with episode resets and held-out evaluation. The adapter supports CPU workers and batched CUDA brains with parallel environment workers, including MiniGrid’s partial observations.
@@ -117,6 +124,7 @@ See [the Gymnasium adapter guide](docs/GYMNASIUM.md) for setup, observation enco
 | `<output>` | Population, births, deaths, predation, resources and brain-slot history |
 | `<output>.behavior.csv` | Food-choice and movement measurements |
 | `<output>.lives.csv` | Sampled completed lifetimes |
+| `<output>.plasticity.csv` | Original-cohort outcomes for plasticity-continuation experiments |
 | `<output>.checkpoint.gz` | Resumable world state |
 | `<output>.png` | Final world image |
 | `<output>.neurons.csv`, `<output>.synapses.csv` | Final neural genomes and synaptic state |
